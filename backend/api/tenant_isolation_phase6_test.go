@@ -1,6 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -168,5 +172,114 @@ func TestPhase6SourceImageReuseCrossTenantDenied(t *testing.T) {
 	}
 	if string(data) != "secret" {
 		t.Fatalf("got %q, want secret", string(data))
+	}
+}
+
+// --- §8 regression: import endpoint rejects storage-backend coordinates ---
+
+// newImportTestServer builds a server in server-storage mode authed by a legacy
+// bearer key (resolves to legacyDefaultUserID), with a file backend rooted in a
+// temp dir. It returns the server, its handler, the auth key, and the temp root
+// so the test can assert where data actually landed.
+func newImportTestServer(t *testing.T) (*Server, http.Handler, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	cfg := config.New(root)
+	if err := cfg.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.App.AuthKey = "test-import-key"
+	cfg.Storage.Backend = "current"
+	cfg.Storage.ImageDir = "data/images"
+	cfg.Storage.ImageConversationStorage = "server"
+	cfg.Storage.ImageDataStorage = "server"
+	cfg.Storage.ImageStorage = "server"
+	server := NewServer(cfg, nil, nil)
+	return server, server.Handler(), cfg.App.AuthKey, root
+}
+
+// TestPhase6ImportIgnoresStorageCoordinates proves the import endpoint accepts
+// ONLY conversation items: any backend/redisAddr/sqlitePath/imageDir coordinates
+// smuggled in the request body are ignored (the handler decodes them into
+// nothing), so a tenant cannot repoint the server at an arbitrary Redis or path.
+// Data must land in the server's own configured store under the caller's userID,
+// never in the attacker-supplied location.
+func TestPhase6ImportIgnoresStorageCoordinates(t *testing.T) {
+	_, handler, authKey, root := newImportTestServer(t)
+
+	// A directory the attacker tries to redirect storage into. If the handler
+	// honored coordinates, conversation files would appear here.
+	evilDir := filepath.Join(t.TempDir(), "evil-redirect")
+
+	body := map[string]any{
+		"items": []map[string]any{
+			{
+				"id":        "imported-conv",
+				"title":     "生成",
+				"mode":      "generate",
+				"prompt":    "hi",
+				"model":     "gpt-image-2",
+				"count":     1,
+				"createdAt": "2026-04-26T00:00:00Z",
+				"status":    "success",
+			},
+		},
+		// Storage coordinates that MUST be ignored.
+		"storage": map[string]any{
+			"backend":     "redis",
+			"redisAddr":   "10.0.0.1:6379",
+			"redisPrefix": "attacker",
+			"sqlitePath":  filepath.Join(evilDir, "evil.sqlite"),
+			"imageDir":    evilDir,
+		},
+		"backend":    "redis",
+		"redisAddr":  "10.0.0.1:6379",
+		"sqlitePath": filepath.Join(evilDir, "evil.sqlite"),
+		"imageDir":   evilDir,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/image/conversations/import", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+authKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// The attacker-supplied directory must not exist: no storage coordinate was honored.
+	if _, err := os.Stat(evilDir); !os.IsNotExist(err) {
+		t.Fatalf("attacker storage dir should never be created, err=%v", err)
+	}
+
+	// Data must be readable from the server's OWN configured store via the list
+	// endpoint, scoped to the caller's userID (legacy bearer → legacyDefaultUserID).
+	listReq := httptest.NewRequest(http.MethodGet, "/api/image/conversations", nil)
+	listReq.Header.Set("Authorization", "Bearer "+authKey)
+	listRec := httptest.NewRecorder()
+	handler.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list = %d, want 200 (body: %s)", listRec.Code, listRec.Body.String())
+	}
+	var listBody struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(listBody.Items) != 1 || listBody.Items[0].ID != "imported-conv" {
+		t.Fatalf("expected imported-conv in server store, got %#v", listBody.Items)
+	}
+
+	// The file landed under the server's configured imageDir, not the evil dir.
+	if _, err := os.Stat(filepath.Join(root, "data", "images")); err != nil {
+		t.Fatalf("server image dir should exist: %v", err)
 	}
 }

@@ -1,12 +1,36 @@
 import "./globals.css";
+import { useEffect, useState } from "react";
+
 import { TopNav } from "@/components/top-nav";
 import { ThemeProvider } from "@/components/theme-provider";
+import { bootstrapSession } from "@/store/session-bootstrap";
 
 export default function AppShell({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // Exchange the mother system's one-time entry ticket for a session cookie
+  // before rendering anything that talks to the API. When no ticket is present
+  // we fall through immediately and rely on an existing cookie (or the 401 →
+  // reauth flow). See store/session-bootstrap.ts.
+  const [bootstrapped, setBootstrapped] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    bootstrapSession().finally(() => {
+      if (!cancelled) {
+        setBootstrapped(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!bootstrapped) {
+    return null;
+  }
+
   return (
     <ThemeProvider>
       <main

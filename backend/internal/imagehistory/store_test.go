@@ -256,6 +256,104 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 	}
 }
 
+// TestCleanupTouchesOnlyOwnUserDir is the §8 item-6 regression: when two users
+// store the same image bytes, deleting/clearing one user's history must remove
+// only that user's copy from its own subdir, never touch the other user's file.
+// Per-user subdirs mean identical bytes hash to the same filename but live in
+// separate directories, so cleanup must be scoped by userID.
+func TestCleanupTouchesOnlyOwnUserDir(t *testing.T) {
+	const (
+		userA = "alice"
+		userB = "bob"
+	)
+	root := t.TempDir()
+	cfg := config.New(root)
+	if err := cfg.Load(); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.Storage.Backend = "current"
+	cfg.Storage.ImageDir = "data/images"
+
+	store, err := NewStore(cfg)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	// Identical bytes for both users → same content hash, different subdirs.
+	payload := base64.StdEncoding.EncodeToString([]byte("shared-across-tenants"))
+	saveFor := func(userID, convID string) *Conversation {
+		t.Helper()
+		saved, err := store.Save(context.Background(), userID, Conversation{
+			ID:        convID,
+			Title:     "生成",
+			Mode:      "generate",
+			Prompt:    "x",
+			Model:     "gpt-image-2",
+			Count:     1,
+			CreatedAt: "2026-04-26T00:00:00Z",
+			Status:    "success",
+			Turns: []Turn{{
+				ID:        convID + "-turn",
+				Title:     "生成",
+				Mode:      "generate",
+				Prompt:    "x",
+				Model:     "gpt-image-2",
+				Count:     1,
+				CreatedAt: "2026-04-26T00:00:00Z",
+				Status:    "success",
+				Images:    []Image{{ID: convID + "-img", Status: "success", B64JSON: payload}},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Save(%s): %v", userID, err)
+		}
+		return saved
+	}
+
+	aConv := saveFor(userA, "conv-a")
+	bConv := saveFor(userB, "conv-b")
+
+	aFile := filenameFromImageURL(aConv.Turns[0].Images[0].URL)
+	bFile := filenameFromImageURL(bConv.Turns[0].Images[0].URL)
+	if aFile == "" || bFile == "" {
+		t.Fatalf("missing image filenames: a=%q b=%q", aFile, bFile)
+	}
+	// Dedup is content-addressed, so the basenames match; isolation comes from
+	// the per-user subdir, not the filename.
+	if aFile != bFile {
+		t.Fatalf("expected identical content-addressed basenames, got a=%q b=%q", aFile, bFile)
+	}
+
+	aPath := filepath.Join(root, "data", "images", userA, aFile)
+	bPath := filepath.Join(root, "data", "images", userB, bFile)
+	if _, err := os.Stat(aPath); err != nil {
+		t.Fatalf("userA image should exist: %v", err)
+	}
+	if _, err := os.Stat(bPath); err != nil {
+		t.Fatalf("userB image should exist: %v", err)
+	}
+
+	// Deleting userA's conversation must remove only userA's file.
+	if err := store.Delete(context.Background(), userA, "conv-a"); err != nil {
+		t.Fatalf("Delete userA: %v", err)
+	}
+	if _, err := os.Stat(aPath); !os.IsNotExist(err) {
+		t.Fatalf("userA image should be gone after delete, err=%v", err)
+	}
+	if _, err := os.Stat(bPath); err != nil {
+		t.Fatalf("userB image must survive userA's delete: %v", err)
+	}
+
+	// Clearing userB must not error and must remove only userB's file.
+	if err := store.Clear(context.Background(), userB); err != nil {
+		t.Fatalf("Clear userB: %v", err)
+	}
+	if _, err := os.Stat(bPath); !os.IsNotExist(err) {
+		t.Fatalf("userB image should be gone after clear, err=%v", err)
+	}
+}
+
 func TestSQLiteStorePersistsImageHistoryAcrossReload(t *testing.T) {
 	testStorePersistenceAcrossReload(t, "sqlite")
 }

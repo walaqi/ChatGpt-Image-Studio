@@ -641,6 +641,23 @@ export async function deleteImageConversation(id: string): Promise<void> {
   await persistConversationCache();
 }
 
+// clearLocalImageConversationCache wipes every browser-side trace of image
+// history: the in-memory snapshot caches plus the localforage instance (whose
+// name is fixed, NOT namespaced by userID). The multi-tenant model forces server
+// history mode, so this localforage data is only ever stale residue from an
+// older browser-mode session — but two users sharing one browser would otherwise
+// read each other's leftover local history. Call this when a new entry ticket is
+// exchanged (the user-switch signal), so no prior user's data survives the switch.
+export async function clearLocalImageConversationCache(): Promise<void> {
+  cachedConversations = null;
+  cachedConversationsStorageMode = null;
+  loadPromise = null;
+  writeQueue = writeQueue.then(async () => {
+    await imageConversationStorage.removeItem(IMAGE_CONVERSATIONS_KEY);
+  });
+  await writeQueue;
+}
+
 export async function clearImageConversations(): Promise<void> {
   if ((await getImageConversationStorageMode()) === "server") {
     await httpRequest("/api/image/conversations", { method: "DELETE" });
