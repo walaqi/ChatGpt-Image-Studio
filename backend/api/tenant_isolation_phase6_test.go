@@ -11,13 +11,57 @@ import (
 
 // --- §8 regression: cross-user image task isolation ---
 
-func newPhase6TaskManager() *imageTaskManager {
-	return newImageTaskManager(&Server{cfg: &config.Config{}})
+// newPhase6TaskManager builds a studio-mode server seeded with one usable Free
+// account so createTask's hasPotentialCompatibleAccounts check passes, then
+// returns that server's task manager.
+func newPhase6TaskManager(t *testing.T) *imageTaskManager {
+	t.Helper()
+	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
+		imageMode:   "studio",
+		accountType: "Free",
+		freeRoute:   "legacy",
+		freeModel:   "auto",
+		paidRoute:   "responses",
+		paidModel:   "gpt-5.4-mini",
+	}, compatTestServerOptions{
+		accounts: []compatSeedAccount{
+			{
+				fileName:    "free-auto.json",
+				accessToken: "token-free-auto",
+				accountType: "Free",
+				priority:    100,
+				quota:       5,
+				status:      "正常",
+			},
+		},
+	})
+	m := server.imageTasks
+	// Async execution goroutines keep writing into the temp data dir; drain
+	// every task to a final status before t.TempDir cleanup runs RemoveAll,
+	// otherwise cleanup races the writers ("directory not empty").
+	t.Cleanup(func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			m.mu.Lock()
+			pending := 0
+			for _, task := range m.tasks {
+				if task != nil && !isFinalImageTaskStatus(task.Status) {
+					pending++
+				}
+			}
+			m.mu.Unlock()
+			if pending == 0 {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+	return m
 }
 
 // TestPhase6TaskListIsolation: listTasks returns only the caller's own tasks.
 func TestPhase6TaskListIsolation(t *testing.T) {
-	m := newPhase6TaskManager()
+	m := newPhase6TaskManager(t)
 	if _, err := m.createTask("userA", createImageTaskRequest{
 		TurnID: "a-1", Mode: "generate", Prompt: "a", Count: 1,
 	}); err != nil {
@@ -41,7 +85,7 @@ func TestPhase6TaskListIsolation(t *testing.T) {
 
 // TestPhase6TaskGetCancelOwnership: get/cancel refuse cross-tenant access.
 func TestPhase6TaskGetCancelOwnership(t *testing.T) {
-	m := newPhase6TaskManager()
+	m := newPhase6TaskManager(t)
 	if _, err := m.createTask("userA", createImageTaskRequest{
 		TurnID: "a-1", Mode: "generate", Prompt: "a", Count: 1,
 	}); err != nil {
@@ -60,7 +104,7 @@ func TestPhase6TaskGetCancelOwnership(t *testing.T) {
 
 // TestPhase6TaskStreamIsolation: a subscriber only receives its own events.
 func TestPhase6TaskStreamIsolation(t *testing.T) {
-	m := newPhase6TaskManager()
+	m := newPhase6TaskManager(t)
 	subID, ch := m.subscribe("userA")
 	defer m.unsubscribe(subID)
 

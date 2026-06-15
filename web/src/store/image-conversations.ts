@@ -3,7 +3,6 @@
 import localforage from "localforage";
 
 import {
-  fetchConfig,
   type ImageModel,
   type ImageQuality,
   type ImageResolutionAccess,
@@ -422,23 +421,6 @@ async function getImageConversationStorageMode() {
   // backend's per-userID store and keeps nothing tenant-specific in the browser.
   setCachedImageConversationStorageMode("server");
   return "server" as const;
-  // eslint-disable-next-line no-unreachable
-  try {
-    const config = await fetchConfig();
-    setCachedImageConversationStorageMode(
-      config.storage.imageConversationStorage === "server"
-        ? "server"
-        : "browser",
-    );
-    return cachedImageConversationStorageMode;
-  } catch (error) {
-    if (cachedImageConversationStorageMode) {
-      return cachedImageConversationStorageMode;
-    }
-    throw error instanceof Error
-      ? error
-      : new Error("无法确定会话记录存储模式");
-  }
 }
 
 async function listServerImageConversations(): Promise<ImageConversation[]> {

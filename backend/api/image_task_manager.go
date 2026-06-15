@@ -866,6 +866,7 @@ func (m *imageTaskManager) newTask(req createImageTaskRequest) (*imageTask, erro
 
 	return &imageTask{
 		ID:              id,
+		UserID:          strings.TrimSpace(req.UserID),
 		ConversationID:  strings.TrimSpace(req.ConversationID),
 		TurnID:          strings.TrimSpace(req.TurnID),
 		Source:          firstNonEmpty(strings.TrimSpace(req.Source), "workspace"),
