@@ -44,6 +44,7 @@ type ServerConfig struct {
 	Host                     string `toml:"host"`
 	Port                     int    `toml:"port"`
 	StaticDir                string `toml:"static_dir"`
+	PublicBasePath           string `toml:"public_base_path"`
 	MaxImageConcurrency      int    `toml:"max_image_concurrency"`
 	ImageQueueLimit          int    `toml:"image_queue_limit"`
 	ImageQueueTimeoutSeconds int    `toml:"image_queue_timeout_seconds"`
@@ -134,6 +135,40 @@ type Sub2APIConfig struct {
 	RequestTimeout int    `toml:"request_timeout"`
 }
 
+// IdentityConfig governs multi-tenant entry-ticket verification and the
+// image-studio self-issued session cookie. See docs/multi-tenant-redesign.md §4.1.
+type IdentityConfig struct {
+	// JWTPublicKeyPath is the PEM file holding the mother system's RS256 public
+	// key, used to verify entry tickets.
+	JWTPublicKeyPath string `toml:"jwt_public_key_path"`
+	// JWTIssuer / JWTAudience are the expected iss/aud claim values.
+	JWTIssuer   string `toml:"jwt_issuer"`
+	JWTAudience string `toml:"jwt_audience"`
+	// SessionSecret signs image-studio's own session cookie (independent of the
+	// mother system's key).
+	SessionSecret string `toml:"session_secret"`
+	// SessionTTLSeconds bounds the session cookie lifetime.
+	SessionTTLSeconds int `toml:"session_ttl_seconds"`
+}
+
+// CredentialConfig governs the two-stage callback to the mother system that
+// resolves a user's channel api-key. See docs/multi-tenant-redesign.md §4.2.
+type CredentialConfig struct {
+	// EndpointBase is the mother system's internal base URL. The two-stage
+	// endpoints are <base>/internal/cred/keys and <base>/internal/cred.
+	EndpointBase string `toml:"endpoint_base"`
+	// InternalSecret is the service-to-service shared secret (X-Internal-Secret).
+	InternalSecret string `toml:"internal_secret"`
+	// CacheTTLSeconds bounds how long resolved plaintext credentials are cached.
+	CacheTTLSeconds int `toml:"cache_ttl_seconds"`
+	// GatewayBaseURL is the OpenAI-compatible gateway image-studio calls with the
+	// user's key. Set per environment; takes precedence over any base_url the
+	// mother system returns.
+	GatewayBaseURL string `toml:"gateway_base_url"`
+	// RequestTimeout bounds the internal callback HTTP timeout (seconds).
+	RequestTimeout int `toml:"request_timeout"`
+}
+
 type Config struct {
 	mu     sync.RWMutex `toml:"-"`
 	loadMu sync.Mutex   `toml:"-"`
@@ -151,6 +186,9 @@ type Config struct {
 	CPA      CPAConfig      `toml:"cpa"`
 	NewAPI   NewAPIConfig   `toml:"newapi"`
 	Sub2API  Sub2APIConfig  `toml:"sub2api"`
+
+	Identity   IdentityConfig   `toml:"identity"`
+	Credential CredentialConfig `toml:"credential"`
 }
 
 func New(rootDir string) *Config {
@@ -441,6 +479,8 @@ func (c *Config) copyFrom(other *Config) {
 	c.CPA = other.CPA
 	c.NewAPI = other.NewAPI
 	c.Sub2API = other.Sub2API
+	c.Identity = other.Identity
+	c.Credential = other.Credential
 	c.paths = other.paths
 }
 
@@ -454,6 +494,62 @@ func (c *Config) SyncProxyURL() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.proxyURLLocked(true)
+}
+
+// PublicBasePath returns the external sub-path prefix (e.g. "/image-studio")
+// used to build browser-visible image URLs in OpenAI-compatible responses. It
+// is normalized to have a leading slash and no trailing slash; empty means no
+// prefix (local direct-access development).
+func (c *Config) PublicBasePath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizePublicBasePath(c.Server.PublicBasePath)
+}
+
+func normalizePublicBasePath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+// SessionTTL returns the configured session cookie lifetime, defaulting to 1h.
+func (c *Config) SessionTTL() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seconds := c.Identity.SessionTTLSeconds
+	if seconds <= 0 {
+		seconds = 3600
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// CredentialCacheTTL returns how long resolved plaintext credentials are
+// cached, defaulting to 60s.
+func (c *Config) CredentialCacheTTL() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seconds := c.Credential.CacheTTLSeconds
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// CredentialRequestTimeout returns the internal callback HTTP timeout,
+// defaulting to 20s.
+func (c *Config) CredentialRequestTimeout() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seconds := c.Credential.RequestTimeout
+	if seconds <= 0 {
+		seconds = 20
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (c *Config) CPAImageBaseURL() string {

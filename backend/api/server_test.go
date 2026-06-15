@@ -137,19 +137,28 @@ func TestResolveImageFilePathFallsBackToOtherDataDirectories(t *testing.T) {
 		t.Fatalf("WriteFile(legacyPath) returned error: %v", err)
 	}
 
-	got := server.resolveImageFilePath("kept.png")
+	got := server.resolveImageFilePath("", "kept.png")
 	if !strings.EqualFold(filepath.Clean(got), filepath.Clean(legacyPath)) {
 		t.Fatalf("resolveImageFilePath() = %q, want %q", got, legacyPath)
 	}
 }
 
-func TestImportImageConversationsIntoSQLiteTarget(t *testing.T) {
+// TestImportImageConversationsUsesServerConfigAndCurrentUser verifies the
+// hardened import handler (review #4): it ignores any storage coordinates in the
+// request body, persists into the server's own configured storage, and scopes
+// the import to the authenticated user. The legacy bearer maps to the default
+// tenant, so we verify the imported conversation lands under that user.
+func TestImportImageConversationsUsesServerConfigAndCurrentUser(t *testing.T) {
 	rootDir := t.TempDir()
 	cfg := config.New(rootDir)
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("Load() returned error: %v", err)
 	}
 	cfg.App.AuthKey = "test-auth"
+	cfg.Storage.Backend = "sqlite"
+	cfg.Storage.SQLitePath = "data/history.sqlite"
+	cfg.Storage.ImageConversationStorage = "server"
+	cfg.Storage.ImageDataStorage = "server"
 	server := NewServer(cfg, nil, nil)
 
 	body := map[string]any{
@@ -184,12 +193,11 @@ func TestImportImageConversationsIntoSQLiteTarget(t *testing.T) {
 				},
 			},
 		},
+		// Storage coordinates must be ignored by the hardened handler. We send a
+		// hostile redis target to prove it is not honored.
 		"storage": map[string]any{
-			"backend":                  "sqlite",
-			"imageDir":                 "data/import-images",
-			"sqlitePath":               "data/import-history.sqlite",
-			"imageConversationStorage": "server",
-			"imageDataStorage":         "server",
+			"backend":   "redis",
+			"redisAddr": "attacker-controlled:6379",
 		},
 	}
 	raw, err := json.Marshal(body)
@@ -207,17 +215,15 @@ func TestImportImageConversationsIntoSQLiteTarget(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	verifyCfg := config.New(rootDir)
-	verifyCfg.Storage.Backend = "sqlite"
-	verifyCfg.Storage.ImageDir = "data/import-images"
-	verifyCfg.Storage.SQLitePath = "data/import-history.sqlite"
-	store, err := imagehistory.NewStore(verifyCfg)
+	// Verify it landed in the SERVER's configured sqlite store under the default
+	// tenant (legacy bearer → legacyDefaultUserID), not any body-specified target.
+	store, err := imagehistory.NewStore(cfg)
 	if err != nil {
-		t.Fatalf("NewStore(verify sqlite) returned error: %v", err)
+		t.Fatalf("NewStore(verify) returned error: %v", err)
 	}
 	defer store.Close()
 
-	items, err := store.List(req.Context())
+	items, err := store.List(req.Context(), legacyDefaultUserID)
 	if err != nil {
 		t.Fatalf("List() returned error: %v", err)
 	}

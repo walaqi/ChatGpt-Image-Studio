@@ -11,6 +11,8 @@ import (
 	"chatgpt2api/internal/config"
 )
 
+const testHistoryUser = "u1"
+
 func newHistoryTestConfig(t *testing.T, backend string) *config.Config {
 	t.Helper()
 	root := t.TempDir()
@@ -41,7 +43,7 @@ func testStorePersistenceAcrossReload(t *testing.T, backend string) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("persist-image-bytes"))
-	if _, err := store.Save(context.Background(), Conversation{
+	if _, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "persist-conv",
 		Title:     "生成",
 		Mode:      "generate",
@@ -71,14 +73,14 @@ func testStorePersistenceAcrossReload(t *testing.T, backend string) {
 	}
 	defer reloaded.Close()
 
-	items, err := reloaded.List(context.Background())
+	items, err := reloaded.List(context.Background(), testHistoryUser)
 	if err != nil {
 		t.Fatalf("List(%s): %v", backend, err)
 	}
 	if len(items) != 1 || items[0].ID != "persist-conv" {
 		t.Fatalf("reloaded items(%s) = %#v", backend, items)
 	}
-	if got := items[0].Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/result-") {
+	if got := items[0].Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/result-") {
 		t.Fatalf("reloaded image url(%s) = %q", backend, got)
 	}
 }
@@ -99,7 +101,7 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("image-bytes"))
-	created, err := store.Save(context.Background(), Conversation{
+	created, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-1",
 		Title:     "生成",
 		Mode:      "generate",
@@ -133,17 +135,17 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 	if got := created.Turns[0].Images[0].B64JSON; got != "" {
 		t.Fatalf("B64JSON should be stripped from stored history, got %q", got)
 	}
-	if got := created.Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/result-") {
+	if got := created.Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/result-") {
 		t.Fatalf("stored result URL = %q", got)
 	}
 	if got := created.Turns[0].SourceImages[0].DataURL; got != "" {
 		t.Fatalf("DataURL should be stripped from stored source, got %q", got)
 	}
-	if got := created.Turns[0].SourceImages[0].URL; !strings.HasPrefix(got, "/v1/files/image/source-") {
+	if got := created.Turns[0].SourceImages[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/source-") {
 		t.Fatalf("stored source URL = %q", got)
 	}
 
-	matches, err := filepath.Glob(filepath.Join(root, "data", "images", "*.png"))
+	matches, err := filepath.Glob(filepath.Join(root, "data", "images", testHistoryUser, "*.png"))
 	if err != nil {
 		t.Fatalf("glob image dir: %v", err)
 	}
@@ -156,7 +158,7 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 		}
 	}
 
-	items, err := store.List(context.Background())
+	items, err := store.List(context.Background(), testHistoryUser)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -181,7 +183,7 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("shared-image-bytes"))
-	first, err := store.Save(context.Background(), Conversation{
+	first, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-1",
 		Title:     "生成",
 		Mode:      "generate",
@@ -205,7 +207,7 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Save first conversation: %v", err)
 	}
-	second, err := store.Save(context.Background(), Conversation{
+	second, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-2",
 		Title:     "生成",
 		Mode:      "generate",
@@ -239,14 +241,14 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 		t.Fatalf("expected shared image file to exist: %v", err)
 	}
 
-	if err := store.Delete(context.Background(), "conv-1"); err != nil {
+	if err := store.Delete(context.Background(), testHistoryUser, "conv-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := os.Stat(sharedPath); err != nil {
 		t.Fatalf("shared image should still exist after deleting one conversation: %v", err)
 	}
 
-	if err := store.Delete(context.Background(), "conv-2"); err != nil {
+	if err := store.Delete(context.Background(), testHistoryUser, "conv-2"); err != nil {
 		t.Fatalf("Delete second: %v", err)
 	}
 	if _, err := os.Stat(sharedPath); !os.IsNotExist(err) {

@@ -88,14 +88,17 @@ type Store struct {
 	imageDir string
 }
 
+// backend persists conversations partitioned by userID. Every method takes a
+// userID so each tenant sees only its own history. An empty userID is the
+// legacy/single-tenant namespace (used by the default bearer auth path).
 type backend interface {
 	Init() error
 	Close() error
-	List(ctx context.Context) ([]Conversation, error)
-	Get(ctx context.Context, id string) (*Conversation, error)
-	Save(ctx context.Context, conversation Conversation) error
-	Delete(ctx context.Context, id string) error
-	Clear(ctx context.Context) error
+	List(ctx context.Context, userID string) ([]Conversation, error)
+	Get(ctx context.Context, userID, id string) (*Conversation, error)
+	Save(ctx context.Context, userID string, conversation Conversation) error
+	Delete(ctx context.Context, userID, id string) error
+	Clear(ctx context.Context, userID string) error
 }
 
 func NewStore(cfg *config.Config) (*Store, error) {
@@ -134,8 +137,8 @@ func (s *Store) Close() error {
 	return s.backend.Close()
 }
 
-func (s *Store) List(ctx context.Context) ([]Conversation, error) {
-	items, err := s.backend.List(ctx)
+func (s *Store) List(ctx context.Context, userID string) ([]Conversation, error) {
+	items, err := s.backend.List(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -143,35 +146,35 @@ func (s *Store) List(ctx context.Context) ([]Conversation, error) {
 	return items, nil
 }
 
-func (s *Store) Get(ctx context.Context, id string) (*Conversation, error) {
-	return s.backend.Get(ctx, cleanID(id))
+func (s *Store) Get(ctx context.Context, userID, id string) (*Conversation, error) {
+	return s.backend.Get(ctx, userID, cleanID(id))
 }
 
-func (s *Store) Save(ctx context.Context, conversation Conversation) (*Conversation, error) {
-	normalized, err := s.normalizeConversation(conversation)
+func (s *Store) Save(ctx context.Context, userID string, conversation Conversation) (*Conversation, error) {
+	normalized, err := s.normalizeConversation(userID, conversation)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.backend.Save(ctx, normalized); err != nil {
+	if err := s.backend.Save(ctx, userID, normalized); err != nil {
 		return nil, err
 	}
 	return &normalized, nil
 }
 
-func (s *Store) Delete(ctx context.Context, id string) error {
-	current, err := s.backend.Get(ctx, cleanID(id))
+func (s *Store) Delete(ctx context.Context, userID, id string) error {
+	current, err := s.backend.Get(ctx, userID, cleanID(id))
 	if err != nil || current == nil {
 		return err
 	}
 	candidateFiles := collectConversationImageFiles(*current)
-	if err := s.backend.Delete(ctx, cleanID(id)); err != nil {
+	if err := s.backend.Delete(ctx, userID, cleanID(id)); err != nil {
 		return err
 	}
-	return s.cleanupCandidateFiles(ctx, candidateFiles)
+	return s.cleanupCandidateFiles(ctx, userID, candidateFiles)
 }
 
-func (s *Store) Clear(ctx context.Context) error {
-	items, err := s.backend.List(ctx)
+func (s *Store) Clear(ctx context.Context, userID string) error {
+	items, err := s.backend.List(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -179,13 +182,13 @@ func (s *Store) Clear(ctx context.Context) error {
 	for _, item := range items {
 		mergeFileSets(candidateFiles, collectConversationImageFiles(item))
 	}
-	if err := s.backend.Clear(ctx); err != nil {
+	if err := s.backend.Clear(ctx, userID); err != nil {
 		return err
 	}
-	return s.cleanupCandidateFiles(ctx, candidateFiles)
+	return s.cleanupCandidateFiles(ctx, userID, candidateFiles)
 }
 
-func (s *Store) normalizeConversation(conversation Conversation) (Conversation, error) {
+func (s *Store) normalizeConversation(userID string, conversation Conversation) (Conversation, error) {
 	conversation.ID = cleanID(conversation.ID)
 	if conversation.ID == "" {
 		return Conversation{}, fmt.Errorf("conversation id is required")
@@ -225,7 +228,7 @@ func (s *Store) normalizeConversation(conversation Conversation) (Conversation, 
 				source.ID = fmt.Sprintf("%s-source-%d", turn.ID, sourceIndex)
 			}
 			if source.URL == "" && strings.TrimSpace(source.DataURL) != "" {
-				url, err := s.saveDataURLAsset(source.DataURL, "source", source.Name)
+				url, err := s.saveDataURLAsset(userID, source.DataURL, "source", source.Name)
 				if err != nil {
 					return Conversation{}, err
 				}
@@ -239,7 +242,7 @@ func (s *Store) normalizeConversation(conversation Conversation) (Conversation, 
 				image.ID = fmt.Sprintf("%s-image-%d", turn.ID, imageIndex)
 			}
 			if image.URL == "" && strings.TrimSpace(image.B64JSON) != "" {
-				url, err := s.saveBase64Asset(image.B64JSON, "result", defaultAssetMIME)
+				url, err := s.saveBase64Asset(userID, image.B64JSON, "result", defaultAssetMIME)
 				if err != nil {
 					return Conversation{}, err
 				}
@@ -272,34 +275,40 @@ func (s *Store) normalizeConversation(conversation Conversation) (Conversation, 
 	return conversation, nil
 }
 
-func (s *Store) saveDataURLAsset(raw, kind, name string) (string, error) {
+func (s *Store) saveDataURLAsset(userID, raw, kind, name string) (string, error) {
 	payload, mimeType, err := decodeDataURL(raw)
 	if err != nil {
 		return "", err
 	}
-	return s.saveAsset(payload, kind, firstNonEmpty(mimeType, mime.TypeByExtension(filepath.Ext(name)), defaultAssetMIME))
+	return s.saveAsset(userID, payload, kind, firstNonEmpty(mimeType, mime.TypeByExtension(filepath.Ext(name)), defaultAssetMIME))
 }
 
-func (s *Store) saveBase64Asset(raw, kind, mimeType string) (string, error) {
+func (s *Store) saveBase64Asset(userID, raw, kind, mimeType string) (string, error) {
 	payload, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
 	if err != nil {
 		return "", fmt.Errorf("decode image: %w", err)
 	}
-	return s.saveAsset(payload, kind, firstNonEmpty(mimeType, defaultAssetMIME))
+	return s.saveAsset(userID, payload, kind, firstNonEmpty(mimeType, defaultAssetMIME))
 }
 
-func (s *Store) saveAsset(payload []byte, kind, mimeType string) (string, error) {
+// saveAsset writes a content-addressed image file under the user's own
+// subdirectory and returns its internal relative URL
+// (/v1/files/image/<userID>/<filename>). Per-user subdirs prevent cross-tenant
+// hash sharing: the same bytes from two users live in separate files, so one
+// user deleting a conversation can never remove another user's asset.
+func (s *Store) saveAsset(userID string, payload []byte, kind, mimeType string) (string, error) {
 	if len(payload) == 0 {
 		return "", fmt.Errorf("image is empty")
 	}
+	dir, urlPrefix := s.userImagePaths(userID)
 	sum := sha256.Sum256(payload)
 	ext := extensionForMIME(mimeType)
 	filename := fmt.Sprintf("%s-%x%s", sanitizeKind(kind), sum[:16], ext)
-	path := filepath.Join(s.imageDir, filename)
+	path := filepath.Join(dir, filename)
 	if _, err := os.Stat(path); err == nil {
-		return "/v1/files/image/" + filename, nil
+		return urlPrefix + filename, nil
 	}
-	if err := os.MkdirAll(s.imageDir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	tmp := path + ".tmp"
@@ -310,7 +319,18 @@ func (s *Store) saveAsset(payload []byte, kind, mimeType string) (string, error)
 		_ = os.Remove(tmp)
 		return "", err
 	}
-	return "/v1/files/image/" + filename, nil
+	return urlPrefix + filename, nil
+}
+
+// userImagePaths returns the on-disk directory and the internal URL prefix for a
+// user's image assets. A blank userID falls back to the flat layout for
+// single-tenant/legacy compatibility.
+func (s *Store) userImagePaths(userID string) (dir string, urlPrefix string) {
+	seg := sanitizeUserID(userID)
+	if seg == "" {
+		return s.imageDir, "/v1/files/image/"
+	}
+	return filepath.Join(s.imageDir, seg), "/v1/files/image/" + seg + "/"
 }
 
 func decodeDataURL(raw string) ([]byte, string, error) {
@@ -395,11 +415,13 @@ func mergeFileSets(target map[string]struct{}, source map[string]struct{}) {
 	}
 }
 
-func (s *Store) cleanupCandidateFiles(ctx context.Context, candidates map[string]struct{}) error {
+func (s *Store) cleanupCandidateFiles(ctx context.Context, userID string, candidates map[string]struct{}) error {
 	if len(candidates) == 0 {
 		return nil
 	}
-	remainingItems, err := s.backend.List(ctx)
+	// Only the same user's remaining conversations can still reference these
+	// files; per-user subdirs guarantee no cross-tenant sharing.
+	remainingItems, err := s.backend.List(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -407,11 +429,12 @@ func (s *Store) cleanupCandidateFiles(ctx context.Context, candidates map[string
 	for _, item := range remainingItems {
 		mergeFileSets(stillReferenced, collectConversationImageFiles(item))
 	}
+	dir, _ := s.userImagePaths(userID)
 	for filename := range candidates {
 		if _, exists := stillReferenced[filename]; exists {
 			continue
 		}
-		path := filepath.Join(s.imageDir, filepath.Base(filename))
+		path := filepath.Join(dir, filepath.Base(filename))
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -427,6 +450,25 @@ func sortConversations(items []Conversation) {
 
 func cleanID(id string) string {
 	return strings.ReplaceAll(strings.TrimSpace(id), "/", "-")
+}
+
+// sanitizeUserID makes a userID safe to use as a single path segment. It strips
+// any path separators and traversal sequences so a malicious or malformed
+// userID can never escape the image directory. A blank result signals the
+// caller to use the flat (single-tenant/legacy) layout.
+func sanitizeUserID(userID string) string {
+	trimmed := strings.TrimSpace(userID)
+	if trimmed == "" {
+		return ""
+	}
+	// Replace separators and collapse traversal; keep it conservative.
+	replacer := strings.NewReplacer("/", "_", "\\", "_", "..", "_")
+	safe := replacer.Replace(trimmed)
+	safe = strings.Trim(safe, ".")
+	if safe == "" {
+		return ""
+	}
+	return safe
 }
 
 func firstNonEmpty(values ...string) string {
@@ -450,8 +492,19 @@ func (b *fileBackend) Close() error {
 	return nil
 }
 
-func (b *fileBackend) List(ctx context.Context) ([]Conversation, error) {
-	entries, err := os.ReadDir(b.dir)
+// userDir returns the per-user conversation directory. A blank userID falls
+// back to the base dir for single-tenant/legacy layout.
+func (b *fileBackend) userDir(userID string) string {
+	seg := sanitizeUserID(userID)
+	if seg == "" {
+		return b.dir
+	}
+	return filepath.Join(b.dir, seg)
+}
+
+func (b *fileBackend) List(ctx context.Context, userID string) ([]Conversation, error) {
+	dir := b.userDir(userID)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return []Conversation{}, nil
@@ -466,7 +519,7 @@ func (b *fileBackend) List(ctx context.Context) ([]Conversation, error) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		conversation, err := b.read(filepath.Join(b.dir, entry.Name()))
+		conversation, err := b.read(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			continue
 		}
@@ -475,8 +528,8 @@ func (b *fileBackend) List(ctx context.Context) ([]Conversation, error) {
 	return result, nil
 }
 
-func (b *fileBackend) Get(_ context.Context, id string) (*Conversation, error) {
-	conversation, err := b.read(b.path(id))
+func (b *fileBackend) Get(_ context.Context, userID, id string) (*Conversation, error) {
+	conversation, err := b.read(b.path(userID, id))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -486,8 +539,9 @@ func (b *fileBackend) Get(_ context.Context, id string) (*Conversation, error) {
 	return &conversation, nil
 }
 
-func (b *fileBackend) Save(_ context.Context, conversation Conversation) error {
-	if err := os.MkdirAll(b.dir, 0o755); err != nil {
+func (b *fileBackend) Save(_ context.Context, userID string, conversation Conversation) error {
+	dir := b.userDir(userID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(conversation, "", "  ")
@@ -495,23 +549,24 @@ func (b *fileBackend) Save(_ context.Context, conversation Conversation) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	tmp := b.path(conversation.ID) + ".tmp"
+	tmp := b.path(userID, conversation.ID) + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, b.path(conversation.ID))
+	return os.Rename(tmp, b.path(userID, conversation.ID))
 }
 
-func (b *fileBackend) Delete(_ context.Context, id string) error {
-	err := os.Remove(b.path(id))
+func (b *fileBackend) Delete(_ context.Context, userID, id string) error {
+	err := os.Remove(b.path(userID, id))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	return err
 }
 
-func (b *fileBackend) Clear(_ context.Context) error {
-	entries, err := os.ReadDir(b.dir)
+func (b *fileBackend) Clear(_ context.Context, userID string) error {
+	dir := b.userDir(userID)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -522,7 +577,7 @@ func (b *fileBackend) Clear(_ context.Context) error {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		if err := os.Remove(filepath.Join(b.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -541,8 +596,8 @@ func (b *fileBackend) read(path string) (Conversation, error) {
 	return conversation, nil
 }
 
-func (b *fileBackend) path(id string) string {
-	return filepath.Join(b.dir, cleanID(id)+".json")
+func (b *fileBackend) path(userID, id string) string {
+	return filepath.Join(b.userDir(userID), cleanID(id)+".json")
 }
 
 type sqliteBackend struct {
@@ -559,8 +614,51 @@ func (b *sqliteBackend) Init() error {
 		return err
 	}
 	b.db = db
-	_, err = b.db.Exec(`CREATE TABLE IF NOT EXISTS image_conversations (id TEXT PRIMARY KEY, raw_json BLOB NOT NULL, updated_at TEXT NOT NULL);`)
+	if _, err = b.db.Exec(`CREATE TABLE IF NOT EXISTS image_conversations (id TEXT PRIMARY KEY, raw_json BLOB NOT NULL, updated_at TEXT NOT NULL);`); err != nil {
+		return err
+	}
+	return b.migrateUserIDColumn()
+}
+
+// migrateUserIDColumn adds the user_id column + index to pre-existing databases.
+// Legacy rows get an empty user_id (treated as the single-tenant tenant).
+func (b *sqliteBackend) migrateUserIDColumn() error {
+	hasColumn, err := b.columnExists("image_conversations", "user_id")
+	if err != nil {
+		return err
+	}
+	if !hasColumn {
+		if _, err := b.db.Exec(`ALTER TABLE image_conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	_, err = b.db.Exec(`CREATE INDEX IF NOT EXISTS idx_conv_user_updated ON image_conversations(user_id, updated_at)`)
 	return err
+}
+
+func (b *sqliteBackend) columnExists(table, column string) (bool, error) {
+	rows, err := b.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			ctype      string
+			notnull    int
+			dfltValue  any
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (b *sqliteBackend) Close() error {
@@ -570,8 +668,8 @@ func (b *sqliteBackend) Close() error {
 	return b.db.Close()
 }
 
-func (b *sqliteBackend) List(_ context.Context) ([]Conversation, error) {
-	rows, err := b.db.Query(`SELECT raw_json FROM image_conversations ORDER BY updated_at DESC`)
+func (b *sqliteBackend) List(_ context.Context, userID string) ([]Conversation, error) {
+	rows, err := b.db.Query(`SELECT raw_json FROM image_conversations WHERE user_id = ? ORDER BY updated_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -591,9 +689,9 @@ func (b *sqliteBackend) List(_ context.Context) ([]Conversation, error) {
 	return result, rows.Err()
 }
 
-func (b *sqliteBackend) Get(_ context.Context, id string) (*Conversation, error) {
+func (b *sqliteBackend) Get(_ context.Context, userID, id string) (*Conversation, error) {
 	var raw []byte
-	err := b.db.QueryRow(`SELECT raw_json FROM image_conversations WHERE id = ?`, id).Scan(&raw)
+	err := b.db.QueryRow(`SELECT raw_json FROM image_conversations WHERE user_id = ? AND id = ?`, userID, id).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -607,27 +705,28 @@ func (b *sqliteBackend) Get(_ context.Context, id string) (*Conversation, error)
 	return &conversation, nil
 }
 
-func (b *sqliteBackend) Save(_ context.Context, conversation Conversation) error {
+func (b *sqliteBackend) Save(_ context.Context, userID string, conversation Conversation) error {
 	raw, err := json.Marshal(conversation)
 	if err != nil {
 		return err
 	}
 	_, err = b.db.Exec(
-		`INSERT INTO image_conversations(id, raw_json, updated_at) VALUES(?, ?, ?) ON CONFLICT(id) DO UPDATE SET raw_json = excluded.raw_json, updated_at = excluded.updated_at`,
+		`INSERT INTO image_conversations(id, user_id, raw_json, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET raw_json = excluded.raw_json, updated_at = excluded.updated_at, user_id = excluded.user_id`,
 		conversation.ID,
+		userID,
 		raw,
 		conversation.CreatedAt,
 	)
 	return err
 }
 
-func (b *sqliteBackend) Delete(_ context.Context, id string) error {
+func (b *sqliteBackend) Delete(_ context.Context, userID, id string) error {
 	_, err := b.db.Exec(`DELETE FROM image_conversations WHERE id = ?`, id)
 	return err
 }
 
-func (b *sqliteBackend) Clear(_ context.Context) error {
-	_, err := b.db.Exec(`DELETE FROM image_conversations`)
+func (b *sqliteBackend) Clear(_ context.Context, userID string) error {
+	_, err := b.db.Exec(`DELETE FROM image_conversations WHERE user_id = ?`, userID)
 	return err
 }
 
@@ -647,8 +746,8 @@ func (b *redisBackend) Close() error {
 	return b.client.Close()
 }
 
-func (b *redisBackend) List(ctx context.Context) ([]Conversation, error) {
-	values, err := b.client.HGetAll(ctx, b.key("conversations")).Result()
+func (b *redisBackend) List(ctx context.Context, userID string) ([]Conversation, error) {
+	values, err := b.client.HGetAll(ctx, b.key(userID, "conversations")).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -663,8 +762,8 @@ func (b *redisBackend) List(ctx context.Context) ([]Conversation, error) {
 	return result, nil
 }
 
-func (b *redisBackend) Get(ctx context.Context, id string) (*Conversation, error) {
-	raw, err := b.client.HGet(ctx, b.key("conversations"), id).Result()
+func (b *redisBackend) Get(ctx context.Context, userID, id string) (*Conversation, error) {
+	raw, err := b.client.HGet(ctx, b.key(userID, "conversations"), id).Result()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -678,22 +777,27 @@ func (b *redisBackend) Get(ctx context.Context, id string) (*Conversation, error
 	return &conversation, nil
 }
 
-func (b *redisBackend) Save(ctx context.Context, conversation Conversation) error {
+func (b *redisBackend) Save(ctx context.Context, userID string, conversation Conversation) error {
 	raw, err := json.Marshal(conversation)
 	if err != nil {
 		return err
 	}
-	return b.client.HSet(ctx, b.key("conversations"), conversation.ID, raw).Err()
+	return b.client.HSet(ctx, b.key(userID, "conversations"), conversation.ID, raw).Err()
 }
 
-func (b *redisBackend) Delete(ctx context.Context, id string) error {
-	return b.client.HDel(ctx, b.key("conversations"), id).Err()
+func (b *redisBackend) Delete(ctx context.Context, userID, id string) error {
+	return b.client.HDel(ctx, b.key(userID, "conversations"), id).Err()
 }
 
-func (b *redisBackend) Clear(ctx context.Context) error {
-	return b.client.Del(ctx, b.key("conversations")).Err()
+func (b *redisBackend) Clear(ctx context.Context, userID string) error {
+	return b.client.Del(ctx, b.key(userID, "conversations")).Err()
 }
 
-func (b *redisBackend) key(name string) string {
+// key namespaces the hash per user: <prefix>:<userID>:conversations. A blank
+// userID falls back to the legacy flat key for single-tenant compatibility.
+func (b *redisBackend) key(userID, name string) string {
+	if seg := sanitizeUserID(userID); seg != "" {
+		return b.prefix + ":" + seg + ":" + name
+	}
 	return b.prefix + ":" + name
 }

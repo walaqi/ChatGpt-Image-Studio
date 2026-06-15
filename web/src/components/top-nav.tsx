@@ -5,7 +5,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Activity, ChevronLeft, ImageIcon, LogOut, PanelLeftClose, PanelLeftOpen, Settings2, Shield } from "lucide-react";
 
 import { fetchVersionInfo } from "@/lib/api";
-import { clearStoredAuthKey } from "@/store/auth";
+import { requestReauth } from "@/store/auth";
 import { cn } from "@/lib/utils";
 import { ThemeToggleButton } from "@/components/theme-toggle-button";
 
@@ -270,8 +270,10 @@ export function TopNav() {
   }, [isImageRoute]);
 
   const handleLogout = async () => {
-    await clearStoredAuthKey();
-    navigate("/login", { replace: true });
+    // Multi-tenant model (§4.6): session lifecycle is owned by the mother
+    // system. "Logout" asks the parent to re-issue an entry ticket rather than
+    // clearing a locally-stored bearer (which no longer exists).
+    requestReauth();
   };
 
   if (pathname === "/login" || pathname === "/login.html" || pathname.startsWith("/login/")) {

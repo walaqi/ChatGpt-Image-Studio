@@ -25,6 +25,10 @@ function syncBackendStaticPlugin(): PluginOption {
 }
 
 export default defineConfig({
+  // Embedded under the mother system at /image-studio/* via same-origin reverse
+  // proxy. The base path makes built asset URLs and the SPA router prefix-aware.
+  // Dev server stays at root for direct local access.
+  base: process.env.NODE_ENV === "production" ? "/image-studio/" : "/",
   plugins: [react(), tailwindcss(), syncBackendStaticPlugin()],
   resolve: {
     alias: {

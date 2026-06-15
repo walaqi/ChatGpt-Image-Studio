@@ -853,9 +853,10 @@ func newImageModeCompatTestServerWithOptions(t *testing.T, scenario imageModeCom
 			inpaintErr:  options.behavior.responsesInpaintErrors[accessToken],
 		}
 	}
-	server.cpaClientFactory = func(baseURL, apiKey string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
+	server.cpaClientFactory = func(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
 		_ = baseURL
 		_ = apiKey
+		_ = imageModel
 		_ = timeout
 		recorder.cpaCalls++
 		return &compatStubWorkflowClient{

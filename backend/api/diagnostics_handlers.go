@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"chatgpt2api/internal/buildinfo"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/outboundproxy"
 )
 
@@ -87,7 +88,7 @@ func (s *Server) handleStartupCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.collectRuntimeStatus())
+	writeJSON(w, http.StatusOK, s.collectRuntimeStatus(r.Context()))
 }
 
 func (s *Server) handleExportDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -102,13 +103,13 @@ func (s *Server) handleExportDiagnostics(w http.ResponseWriter, r *http.Request)
 			"buildTime": buildinfo.BuildTime,
 		},
 		StartupCheck: s.runStartupCheck(r.Context()),
-		Runtime:      s.collectRuntimeStatus(),
+		Runtime:      s.collectRuntimeStatus(r.Context()),
 		Config:       s.maskSensitiveConfig(s.buildConfigPayload()),
 		RequestLogs:  s.reqLogs.list(100),
 	})
 }
 
-func (s *Server) collectRuntimeStatus() runtimeStatusResponse {
+func (s *Server) collectRuntimeStatus(ctx context.Context) runtimeStatusResponse {
 	now := time.Now()
 	out := runtimeStatusResponse{
 		Timestamp: now.Format(time.RFC3339Nano),
@@ -125,7 +126,8 @@ func (s *Server) collectRuntimeStatus() runtimeStatusResponse {
 		out.Admission.Queued = snapshot.Queued
 	}
 	if s.imageTasks != nil {
-		_, snapshot := s.imageTasks.listTasks()
+		userID, _ := identity.UserIDFromContext(ctx)
+		_, snapshot := s.imageTasks.listTasks(userID)
 		if snapshot != nil {
 			out.Tasks.Total = snapshot.Total
 			out.Tasks.Running = snapshot.Running

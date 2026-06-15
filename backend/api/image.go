@@ -3,14 +3,26 @@ package api
 import (
 	"context"
 	"net/http"
+	"path/filepath"
 
 	"chatgpt2api/handler"
-	"chatgpt2api/internal/imagehistory"
 )
 
-// buildImageResponse converts ImageResults to the OpenAI-compatible response format.
-// Only includes url/b64_json and revised_prompt — no internal ChatGPT fields.
-func buildImageResponse(r *http.Request, client imageDownloader, results []handler.ImageResult, responseFormat string, sourceAccountID string, cacheDir string) []map[string]any {
+// buildImageResponse converts ImageResults to the OpenAI-compatible response
+// format. Only includes url/b64_json and revised_prompt — no internal ChatGPT
+// fields.
+//
+// Multi-tenant: cached files live under the user's own subdirectory
+// (<imageBaseDir>/<userID>/) and the returned absolute URL carries both the
+// <userID> path segment and publicBasePath (e.g. /image-studio) so a same-origin
+// reverse proxy routes it back to this backend and per-user ownership can be
+// enforced when the file is served. A blank userID keeps the flat legacy layout.
+func buildImageResponse(r *http.Request, client imageDownloader, results []handler.ImageResult, responseFormat, sourceAccountID, userID, imageBaseDir, publicBasePath string) []map[string]any {
+	urlSeg := userImageURLSegment(userID)
+	cacheDir := imageBaseDir
+	if urlSeg != "" {
+		cacheDir = filepath.Join(imageBaseDir, urlSeg)
+	}
 	return buildImageResponseItems(
 		r.Context(),
 		client,
@@ -19,40 +31,13 @@ func buildImageResponse(r *http.Request, client imageDownloader, results []handl
 		sourceAccountID,
 		cacheDir,
 		func(filename string) string {
-			return gatewayImageURL(r, filename)
+			rel := filename
+			if urlSeg != "" {
+				rel = urlSeg + "/" + filename
+			}
+			return gatewayImageURL(r, publicBasePath, rel)
 		},
 	)
-}
-
-func buildImageHistoryImages(ctx context.Context, client imageDownloader, results []handler.ImageResult, responseFormat string, sourceAccountID string, cacheDir string) []imagehistory.Image {
-	items := buildImageResponseItems(
-		ctx,
-		client,
-		results,
-		responseFormat,
-		sourceAccountID,
-		cacheDir,
-		func(filename string) string {
-			return "/v1/files/image/" + filename
-		},
-	)
-	historyImages := make([]imagehistory.Image, 0, len(items))
-	for index, item := range items {
-		historyImages = append(historyImages, imagehistory.Image{
-			ID:              firstNonEmpty(stringValue(item["id"]), stringValue(item["file_id"]), stringValue(item["gen_id"]), "image-"+stringValue(index)),
-			Status:          "success",
-			B64JSON:         stringValue(item["b64_json"]),
-			URL:             stringValue(item["url"]),
-			RevisedPrompt:   stringValue(item["revised_prompt"]),
-			FileID:          stringValue(item["file_id"]),
-			GenID:           stringValue(item["gen_id"]),
-			ConversationID:  stringValue(item["conversation_id"]),
-			ParentMessageID: stringValue(item["parent_message_id"]),
-			SourceAccountID: stringValue(item["source_account_id"]),
-			Error:           stringValue(item["error"]),
-		})
-	}
-	return historyImages
 }
 
 func buildImageResponseItems(
@@ -98,4 +83,11 @@ func buildImageResponseItems(
 		data = append(data, item)
 	}
 	return data
+}
+
+// userImageURLSegment sanitizes userID into a single safe path element used both
+// as the on-disk subdirectory and the URL segment. A blank userID yields "" so
+// the flat legacy layout is preserved.
+func userImageURLSegment(userID string) string {
+	return sanitizeUserSegment(userID)
 }

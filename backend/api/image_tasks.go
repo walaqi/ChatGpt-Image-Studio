@@ -48,23 +48,26 @@ type imageTaskSourceReferencePayload struct {
 }
 
 type createImageTaskRequest struct {
-	TaskID          string                              `json:"taskId,omitempty"`
-	ConversationID  string                              `json:"conversationId"`
-	TurnID          string                              `json:"turnId"`
-	Source          string                              `json:"source,omitempty"`
-	Mode            string                              `json:"mode"`
-	Prompt          string                              `json:"prompt"`
-	Model           string                              `json:"model"`
-	Count           int                                 `json:"count"`
-	Size            string                              `json:"size,omitempty"`
-	ResolutionAccess string                             `json:"resolutionAccess,omitempty"`
-	Quality         string                              `json:"quality,omitempty"`
-	Background      string                              `json:"background,omitempty"`
-	ResponseFormat  string                              `json:"responseFormat,omitempty"`
-	RetryImageIndex *int                                `json:"retryImageIndex,omitempty"`
-	SourceImages    []imageTaskSourceImagePayload       `json:"sourceImages,omitempty"`
-	SourceReference *imageTaskSourceReferencePayload    `json:"sourceReference,omitempty"`
-	Policy          *accounts.ImageAccountRoutingPolicy `json:"policy,omitempty"`
+	// UserID is set by the handler from the session context (not JSON) so the
+	// task is owned by the authenticated tenant.
+	UserID           string                              `json:"-"`
+	TaskID           string                              `json:"taskId,omitempty"`
+	ConversationID   string                              `json:"conversationId"`
+	TurnID           string                              `json:"turnId"`
+	Source           string                              `json:"source,omitempty"`
+	Mode             string                              `json:"mode"`
+	Prompt           string                              `json:"prompt"`
+	Model            string                              `json:"model"`
+	Count            int                                 `json:"count"`
+	Size             string                              `json:"size,omitempty"`
+	ResolutionAccess string                              `json:"resolutionAccess,omitempty"`
+	Quality          string                              `json:"quality,omitempty"`
+	Background       string                              `json:"background,omitempty"`
+	ResponseFormat   string                              `json:"responseFormat,omitempty"`
+	RetryImageIndex  *int                                `json:"retryImageIndex,omitempty"`
+	SourceImages     []imageTaskSourceImagePayload       `json:"sourceImages,omitempty"`
+	SourceReference  *imageTaskSourceReferencePayload    `json:"sourceReference,omitempty"`
+	Policy           *accounts.ImageAccountRoutingPolicy `json:"policy,omitempty"`
 }
 
 type imageTaskBlocker struct {
@@ -101,6 +104,10 @@ type imageTaskView struct {
 	Images          []imagehistory.Image   `json:"images"`
 	Error           string                 `json:"error,omitempty"`
 	CancelRequested bool                   `json:"cancelRequested,omitempty"`
+
+	// ownerUserID is the tenant that owns this task. It is not serialized; it
+	// lets broadcast() scope events to the owning user's SSE subscribers.
+	ownerUserID string `json:"-"`
 }
 
 type imageTaskSnapshot struct {
@@ -118,6 +125,10 @@ type imageTaskEvent struct {
 	TaskID   string             `json:"taskId,omitempty"`
 	Task     *imageTaskView     `json:"task,omitempty"`
 	Snapshot *imageTaskSnapshot `json:"snapshot,omitempty"`
+	// userID owns this event; it is not serialized. broadcast() delivers an
+	// event only to subscribers of the same user, isolating cross-tenant
+	// task/queue/SSE visibility.
+	userID string `json:"-"`
 }
 
 type imageTaskRequirement struct {
@@ -155,6 +166,7 @@ type imageTaskUnit struct {
 
 type imageTask struct {
 	ID              string
+	UserID          string
 	ConversationID  string
 	TurnID          string
 	Source          string

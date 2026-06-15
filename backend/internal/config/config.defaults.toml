@@ -12,6 +12,10 @@ max_upload_size_mb = 50
 host = "0.0.0.0"
 port = 7000
 static_dir = "static"
+# 对外子路径前缀（同源反代嵌入时设为 "/image-studio"）。
+# 用于在兼容 /v1/images/* 响应里生成浏览器可见的图片 URL。
+# 留空表示本地直连开发，不加前缀。
+public_base_path = ""
 max_image_concurrency = 8
 image_queue_limit = 32
 image_queue_timeout_seconds = 20
@@ -113,6 +117,23 @@ email = ""
 password = ""
 api_key = ""
 group_id = ""
+request_timeout = 20
+
+# 多租户身份：母系统签发的一次性 RS256 入口票据 + image-studio 自有会话。
+# 仅在嵌入母系统的多租户部署下需要配置；单机模式可留空。
+[identity]
+jwt_public_key_path = ""          # 母系统 RS256 公钥 PEM 路径
+jwt_issuer = "sub2api"            # 入口票据 iss，需与母系统对齐
+jwt_audience = "image-studio"     # 入口票据 aud，需与母系统对齐
+session_secret = ""               # image-studio 自有会话签名密钥（与母系统公钥无关）
+session_ttl_seconds = 3600
+
+# 多租户凭证：两段式回调母系统内部端点，按 userID + key_id 取用户渠道 key。
+[credential]
+endpoint_base = ""                # 母系统内网基址，如 http://main-system-internal:8080
+internal_secret = ""              # service-to-service 鉴权 X-Internal-Secret
+cache_ttl_seconds = 60
+gateway_base_url = ""             # 用户 key 调用的网关地址，区分环境
 request_timeout = 20
 
 [log]

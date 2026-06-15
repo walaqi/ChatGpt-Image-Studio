@@ -1,6 +1,5 @@
 import { httpRequest } from "@/lib/request";
 import webConfig from "@/constants/common-env";
-import { getStoredAuthKey } from "@/store/auth";
 import {
   buildImageAccountPolicyHeader,
   normalizeImageAccountPolicy,
@@ -572,16 +571,49 @@ export type Sub2APIGroupsResult = {
   groups: Sub2APIGroupOption[];
 };
 
-export async function login(authKey: string) {
-  const normalizedAuthKey = String(authKey || "").trim();
-  return httpRequest<{ ok: boolean }>("/auth/login", {
+// exchangeEntryTicket posts a one-time entry ticket to establish the session
+// cookie. Used by the bootstrap flow; the cookie is set via Set-Cookie.
+export async function exchangeEntryTicket(ticket: string) {
+  return httpRequest<{ ok: boolean; version?: string }>("/auth/session", {
     method: "POST",
-    body: {},
-    headers: {
-      Authorization: `Bearer ${normalizedAuthKey}`,
-    },
+    headers: { Authorization: `Bearer ${ticket}` },
     redirectOnUnauthorized: false,
   });
+}
+
+export type CredentialKeyCandidate = {
+  key_id: number;
+  name: string;
+  quota: number;
+  quota_used: number;
+  expires_at: string;
+  group_name: string;
+};
+
+export type CredentialKeyListResult = {
+  keys: CredentialKeyCandidate[];
+  can_create: boolean;
+  image_group_id: number | null;
+};
+
+export async function fetchCredentialKeys() {
+  return httpRequest<CredentialKeyListResult>("/api/image/credential/keys");
+}
+
+export async function fetchCurrentCredential() {
+  return httpRequest<{ key_id: number; selected: boolean }>(
+    "/api/image/credential/current",
+  );
+}
+
+export async function setCurrentCredential(keyId: number) {
+  return httpRequest<{ ok: boolean; key_id: number }>(
+    "/api/image/credential/current",
+    {
+      method: "PUT",
+      body: { key_id: keyId },
+    },
+  );
 }
 
 export async function fetchAccounts() {
@@ -754,12 +786,11 @@ export async function fetchRuntimeStatus() {
 }
 
 export async function downloadDiagnosticsExport() {
-  const authKey = await getStoredAuthKey();
   const response = await fetch(
     `${webConfig.apiUrl.replace(/\/$/, "")}/api/diagnostics/export`,
     {
       method: "GET",
-      headers: authKey ? { Authorization: `Bearer ${authKey}` } : {},
+      credentials: "include",
     },
   );
   if (!response.ok) {
@@ -905,12 +936,12 @@ export async function consumeImageTaskStream(
   },
   signal: AbortSignal,
 ) {
-  const authKey = await getStoredAuthKey();
   const response = await fetch(
     `${webConfig.apiUrl.replace(/\/$/, "")}/api/image/tasks/stream`,
     {
       method: "GET",
-      headers: authKey ? { Authorization: `Bearer ${authKey}` } : {},
+      headers: { Accept: "text/event-stream" },
+      credentials: "include",
       signal,
     },
   );

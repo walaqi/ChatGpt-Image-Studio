@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"chatgpt2api/internal/accounts"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/imaging"
 )
 
@@ -100,6 +101,7 @@ func newCompatInputError(code, message string) error {
 }
 
 func (s *Server) executeImageGeneration(ctx context.Context, req imageGenerationRequest, r *http.Request) (map[string]any, error) {
+	compatUserID, _ := identity.UserIDFromContext(ctx)
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
 		return nil, newRequestError("prompt_required", "prompt is required")
@@ -135,7 +137,7 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 		return nil, newRequestError("no_available_image_accounts", "当前没有可用的图片账号")
 	}
 
-	task, err := s.imageTasks.createTask(createImageTaskRequest{
+	task, err := s.imageTasks.createTask(compatUserID, createImageTaskRequest{
 		ConversationID: "",
 		TurnID:         fmt.Sprintf("compat-generate-%d", time.Now().UnixNano()),
 		Source:         "compat",
@@ -152,7 +154,7 @@ func (s *Server) executeImageGeneration(ctx context.Context, req imageGeneration
 	if err != nil {
 		return nil, err
 	}
-	finalTask, err := s.imageTasks.waitForTask(ctx, task.ID)
+	finalTask, err := s.imageTasks.waitForTask(ctx, compatUserID, task.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +166,7 @@ func normalizeGenerateImageSize(value string) string {
 }
 
 func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *http.Request) (map[string]any, error) {
+	compatUserID, _ := identity.UserIDFromContext(ctx)
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
 		return nil, newRequestError("prompt_required", "prompt is required")
@@ -193,7 +196,7 @@ func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *
 		return nil, err
 	}
 
-	task, err := s.imageTasks.createTask(createImageTaskRequest{
+	task, err := s.imageTasks.createTask(compatUserID, createImageTaskRequest{
 		ConversationID: "",
 		TurnID:         fmt.Sprintf("compat-edit-%d", time.Now().UnixNano()),
 		Source:         "compat",
@@ -210,7 +213,7 @@ func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *
 	if err != nil {
 		return nil, err
 	}
-	finalTask, err := s.imageTasks.waitForTask(ctx, task.ID)
+	finalTask, err := s.imageTasks.waitForTask(ctx, compatUserID, task.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -218,6 +221,7 @@ func (s *Server) executeImageEdit(ctx context.Context, req imageEditRequest, r *
 }
 
 func (s *Server) executeImageSelectionEdit(ctx context.Context, req imageSelectionEditRequest, r *http.Request) (map[string]any, error) {
+	compatUserID, _ := identity.UserIDFromContext(ctx)
 	prompt := strings.TrimSpace(req.Prompt)
 	if prompt == "" {
 		return nil, newRequestError("prompt_required", "prompt is required")
@@ -233,7 +237,7 @@ func (s *Server) executeImageSelectionEdit(ctx context.Context, req imageSelecti
 		return nil, newRequestError("source_account_id_required", "source_account_id is required for selection edit")
 	}
 
-	task, err := s.imageTasks.createTask(createImageTaskRequest{
+	task, err := s.imageTasks.createTask(compatUserID, createImageTaskRequest{
 		ConversationID: "",
 		TurnID:         fmt.Sprintf("compat-selection-edit-%d", time.Now().UnixNano()),
 		Source:         "compat",
@@ -261,7 +265,7 @@ func (s *Server) executeImageSelectionEdit(ctx context.Context, req imageSelecti
 	if err != nil {
 		return nil, err
 	}
-	finalTask, err := s.imageTasks.waitForTask(ctx, task.ID)
+	finalTask, err := s.imageTasks.waitForTask(ctx, compatUserID, task.ID)
 	if err != nil {
 		return nil, err
 	}

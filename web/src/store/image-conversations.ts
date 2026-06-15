@@ -415,9 +415,14 @@ export function normalizeConversation(
 }
 
 async function getImageConversationStorageMode() {
-  if (cachedImageConversationStorageMode) {
-    return cachedImageConversationStorageMode;
-  }
+  // Multi-tenant embedded model (docs/multi-tenant-redesign.md §4.6, review #5):
+  // history ALWAYS uses server mode. Browser/localforage history is keyed by a
+  // fixed name, so two users opening the iframe in the same browser would read
+  // each other's local history. Forcing server mode routes history through the
+  // backend's per-userID store and keeps nothing tenant-specific in the browser.
+  setCachedImageConversationStorageMode("server");
+  return "server" as const;
+  // eslint-disable-next-line no-unreachable
   try {
     const config = await fetchConfig();
     setCachedImageConversationStorageMode(

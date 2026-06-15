@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"chatgpt2api/internal/identity"
 )
 
 const defaultImageDir = "data/tmp/image"
@@ -48,25 +50,42 @@ func downloadAndCache(client imageDownloader, upstreamURL string, cacheDir strin
 	return filename, nil
 }
 
-// gatewayImageURL builds the public URL for a cached image.
-func gatewayImageURL(r *http.Request, filename string) string {
+// gatewayImageURL builds the public absolute URL for a cached image. filename
+// already includes the per-user segment (e.g. "<userID>/<file>"). basePath is
+// the public sub-path prefix (e.g. "/image-studio") so the URL is reachable
+// through the reverse proxy; it may be empty for local/direct deployments.
+func gatewayImageURL(r *http.Request, basePath, filename string) string {
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
 	host := r.Host
-	return fmt.Sprintf("%s://%s/v1/files/image/%s", scheme, host, filename)
+	return fmt.Sprintf("%s://%s%s/v1/files/image/%s", scheme, host, basePath, filename)
 }
 
-func (s *Server) resolveImageFilePath(name string) string {
+// resolveImageFilePath locates a stored image for the given userID. Files live
+// under <imageDir>/<userID>/<filename>; a blank userID falls back to the flat
+// legacy layout. The userID segment is sanitized to a single path element so a
+// caller cannot escape its own subdirectory.
+func (s *Server) resolveImageFilePath(userID, name string) string {
 	baseName := filepath.Base(strings.TrimSpace(name))
-	candidates := []string{
+	if baseName == "" || baseName == "." || baseName == "/" {
+		return ""
+	}
+	userSeg := sanitizeUserSegment(userID)
+
+	candidates := []string{}
+	if userSeg != "" {
+		candidates = append(candidates,
+			filepath.Join(s.cfg.ResolvePath(s.cfg.Storage.ImageDir), userSeg, baseName),
+			filepath.Join(s.cfg.ResolvePath(defaultImageDir), userSeg, baseName),
+		)
+	}
+	// Legacy flat layout (assets written before multi-tenant migration).
+	candidates = append(candidates,
 		filepath.Join(s.cfg.ResolvePath(s.cfg.Storage.ImageDir), baseName),
-	}
-	legacyPath := filepath.Join(s.cfg.ResolvePath(defaultImageDir), baseName)
-	if !strings.EqualFold(filepath.Clean(legacyPath), filepath.Clean(candidates[0])) {
-		candidates = append(candidates, legacyPath)
-	}
+		filepath.Join(s.cfg.ResolvePath(defaultImageDir), baseName),
+	)
 	for _, candidate := range candidates {
 		info, err := os.Stat(candidate)
 		if err == nil && info.Mode().IsRegular() {
@@ -74,6 +93,21 @@ func (s *Server) resolveImageFilePath(name string) string {
 		}
 	}
 	return s.searchImageFilePathFallback(baseName)
+}
+
+// sanitizeUserSegment reduces a userID to a safe single path element. It mirrors
+// imagehistory.sanitizeUserID: only the basename is kept and traversal tokens
+// are rejected.
+func sanitizeUserSegment(userID string) string {
+	trimmed := strings.TrimSpace(userID)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = filepath.Base(filepath.Clean(trimmed))
+	if trimmed == "." || trimmed == ".." || trimmed == "/" || strings.ContainsAny(trimmed, `/\`) {
+		return ""
+	}
+	return trimmed
 }
 
 func (s *Server) searchImageFilePathFallback(name string) string {
@@ -111,14 +145,26 @@ func (s *Server) searchImageFilePathFallback(name string) string {
 
 // handleImageFile serves cached and server-stored images from storage.image_dir.
 func (s *Server) handleImageFile(w http.ResponseWriter, r *http.Request) {
-	name := strings.TrimPrefix(r.URL.Path, "/v1/files/image/")
-	name = strings.ReplaceAll(name, "/", "-")
-	if name == "" {
+	raw := strings.TrimPrefix(r.URL.Path, "/v1/files/image/")
+	if raw == "" {
 		writeError(w, http.StatusNotFound, "image not found")
 		return
 	}
 
-	path := s.resolveImageFilePath(name)
+	// The path may be "<userID>/<filename>" (multi-tenant) or a bare
+	// "<filename>" (legacy flat layout). Split off the optional owner segment.
+	owner, filename := splitImageOwnerPath(raw)
+
+	// Ownership enforcement: when the path is namespaced by userID, the caller's
+	// session userID must match. This blocks cross-tenant downloads. The session
+	// userID is injected by requireSession (the route is gated).
+	sessionUser, _ := identity.UserIDFromContext(r.Context())
+	if owner != "" && sessionUser != "" && owner != sessionUser {
+		writeError(w, http.StatusForbidden, "image not found")
+		return
+	}
+
+	path := s.resolveImageFilePath(owner, filename)
 	if path == "" {
 		writeError(w, http.StatusNotFound, "image not found")
 		return
@@ -140,4 +186,19 @@ func (s *Server) handleImageFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Header().Set("Content-Type", ct)
 	http.ServeFile(w, r, path)
+}
+
+// splitImageOwnerPath splits a "<userID>/<filename>" image path into its owner
+// segment and filename. A bare "<filename>" (no slash) returns an empty owner,
+// preserving the legacy flat layout. Only the first segment is treated as the
+// owner; any deeper path is flattened to its basename by the caller.
+func splitImageOwnerPath(raw string) (owner, filename string) {
+	raw = strings.TrimSpace(strings.Trim(raw, "/"))
+	if raw == "" {
+		return "", ""
+	}
+	if idx := strings.Index(raw, "/"); idx >= 0 {
+		return raw[:idx], raw[idx+1:]
+	}
+	return "", raw
 }

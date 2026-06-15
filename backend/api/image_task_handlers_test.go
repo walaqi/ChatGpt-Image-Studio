@@ -60,7 +60,7 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 
 	waitForTaskStatus(t, server, payload.Task.ID, imageTaskStatusSucceeded)
 
-	task, _, err := server.imageTasks.getTask(payload.Task.ID)
+	task, _, err := server.imageTasks.getTask("", payload.Task.ID)
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestCreateImageEditTaskHighResolutionUsesPaidAccount(t *testing.T) {
 		},
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-edit-paid-1",
 		TurnID:         "turn-edit-paid-1",
 		Mode:           "edit",
@@ -240,7 +240,7 @@ func TestCreateImageGenerateTaskAutoFreeUsesFreeAccount(t *testing.T) {
 		},
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID:   "conv-generate-auto-free-1",
 		TurnID:           "turn-generate-auto-free-1",
 		Mode:             "generate",
@@ -293,7 +293,7 @@ func TestCreateImageGenerateTaskAutoPaidUsesPaidAccount(t *testing.T) {
 		},
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID:   "conv-generate-auto-paid-1",
 		TurnID:           "turn-generate-auto-paid-1",
 		Mode:             "generate",
@@ -338,7 +338,7 @@ func TestCreateImageGenerateTaskAutoPaidRequiresPaidAccount(t *testing.T) {
 		},
 	})
 
-	_, err := server.imageTasks.createTask(createImageTaskRequest{
+	_, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID:   "conv-generate-auto-paid-no-paid",
 		TurnID:           "turn-generate-auto-paid-no-paid",
 		Mode:             "generate",
@@ -365,14 +365,14 @@ func waitForTaskStatus(t *testing.T, server *Server, taskID string, want imageTa
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(taskID)
+		task, _, err := server.imageTasks.getTask("", taskID)
 		if err == nil && task != nil && imageTaskStatus(task.Status) == want {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	task, _, err := server.imageTasks.getTask(taskID)
+	task, _, err := server.imageTasks.getTask("", taskID)
 	if err != nil {
 		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
 	}
@@ -389,7 +389,7 @@ func TestImageTaskStreamWritesInitPayload(t *testing.T) {
 		paidModel:   "gpt-5.4-mini",
 	}, compatTestServerOptions{})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-stream-1",
 		TurnID:         "turn-stream-1",
 		Mode:           "generate",
@@ -458,7 +458,7 @@ func TestSchedulePublishesQueuedBlockerUpdatesWhenConcurrencyIsFull(t *testing.T
 	server.imageTasks.runningUnits = server.imageTasks.maxRunningLocked()
 	server.imageTasks.mu.Unlock()
 
-	subID, ch := server.imageTasks.subscribe()
+	subID, ch := server.imageTasks.subscribe("")
 	defer server.imageTasks.unsubscribe(subID)
 
 	if server.imageTasks.tryScheduleOne() {
@@ -522,7 +522,7 @@ func TestCreateImageTaskRetriesRateLimitedAccount(t *testing.T) {
 		},
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-retry-1",
 		TurnID:         "turn-retry-1",
 		Mode:           "generate",
@@ -535,7 +535,7 @@ func TestCreateImageTaskRetriesRateLimitedAccount(t *testing.T) {
 
 	waitForTaskStatus(t, server, "turn-retry-1", imageTaskStatusSucceeded)
 
-	task, _, err := server.imageTasks.getTask("turn-retry-1")
+	task, _, err := server.imageTasks.getTask("", "turn-retry-1")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -592,7 +592,7 @@ func TestCreateImageTaskRetriesTransientResponsesSSEError(t *testing.T) {
 		}
 	}
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-transient-1",
 		TurnID:         "turn-transient-1",
 		Mode:           "generate",
@@ -609,7 +609,7 @@ func TestCreateImageTaskRetriesTransientResponsesSSEError(t *testing.T) {
 		return task.Status == imageTaskStatusSucceeded
 	})
 
-	task, _, err := server.imageTasks.getTask("turn-transient-1")
+	task, _, err := server.imageTasks.getTask("", "turn-transient-1")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -645,7 +645,7 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 		}
 	}
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-cancel-1",
 		TurnID:         "turn-cancel-1",
 		Mode:           "generate",
@@ -660,13 +660,13 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.cancelTask("turn-cancel-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask("", "turn-cancel-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
 	waitForTaskStatus(t, server, "turn-cancel-1", imageTaskStatusCancelled)
 
-	task, _, err := server.imageTasks.getTask("turn-cancel-1")
+	task, _, err := server.imageTasks.getTask("", "turn-cancel-1")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -703,7 +703,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 		}
 	}
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-cancel-fast-1",
 		TurnID:         "turn-cancel-fast-1",
 		Mode:           "generate",
@@ -719,7 +719,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 	})
 
 	startedAt := time.Now()
-	if _, err := server.imageTasks.cancelTask("turn-cancel-fast-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask("", "turn-cancel-fast-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
@@ -796,7 +796,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 		}
 	}
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-expire-runner",
 		TurnID:         "turn-expire-runner",
 		Mode:           "generate",
@@ -810,7 +810,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask("", createImageTaskRequest{
 		ConversationID: "conv-expire-queued",
 		TurnID:         "turn-expire-queued",
 		Mode:           "generate",
@@ -823,7 +823,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 
 	waitForTaskStatus(t, server, "turn-expire-queued", imageTaskStatusExpired)
 
-	task, _, err := server.imageTasks.getTask("turn-expire-queued")
+	task, _, err := server.imageTasks.getTask("", "turn-expire-queued")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -868,10 +868,10 @@ func TestCompletedImageTaskIsPrunedAfterRetention(t *testing.T) {
 		t.Fatal("tryScheduleOne() = false, want prune cycle to run")
 	}
 
-	if _, _, err := server.imageTasks.getTask(task.ID); err == nil {
+	if _, _, err := server.imageTasks.getTask("", task.ID); err == nil {
 		t.Fatalf("getTask(%s) error = nil, want pruned task to be removed", task.ID)
 	}
-	items, snapshot := server.imageTasks.listTasks()
+	items, snapshot := server.imageTasks.listTasks("")
 	if len(items) != 0 {
 		t.Fatalf("len(items) = %d, want 0 after pruning", len(items))
 	}
@@ -910,7 +910,7 @@ func TestTaskSnapshotCountsQueuedUnitsWithinRunningParentTask(t *testing.T) {
 	server.imageTasks.tasks[task.ID] = task
 	server.imageTasks.order = append(server.imageTasks.order, task.ID)
 	server.imageTasks.runningUnits = 2
-	snapshot := server.imageTasks.snapshotLocked()
+	snapshot := server.imageTasks.snapshotLocked("")
 	server.imageTasks.mu.Unlock()
 
 	if snapshot.Running != 2 {
@@ -973,14 +973,14 @@ func waitForTaskPredicate(t *testing.T, server *Server, taskID string, predicate
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(taskID)
+		task, _, err := server.imageTasks.getTask("", taskID)
 		if err == nil && task != nil && predicate(task) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	task, _, err := server.imageTasks.getTask(taskID)
+	task, _, err := server.imageTasks.getTask("", taskID)
 	if err != nil {
 		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
 	}

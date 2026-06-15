@@ -186,7 +186,7 @@ func (s *Server) resolveTaskEditInputs(task *imageTask) ([]byte, [][]byte, error
 	imageFiles := make([][]byte, 0)
 	var mask []byte
 	for _, source := range task.SourceImages {
-		data, err := s.resolveTaskSourceImageBytes(source)
+		data, err := s.resolveTaskSourceImageBytes(task.UserID, source)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -199,7 +199,7 @@ func (s *Server) resolveTaskEditInputs(task *imageTask) ([]byte, [][]byte, error
 	return mask, imageFiles, nil
 }
 
-func (s *Server) resolveTaskSourceImageBytes(source imageTaskSourceImage) ([]byte, error) {
+func (s *Server) resolveTaskSourceImageBytes(ownerUserID string, source imageTaskSourceImage) ([]byte, error) {
 	if strings.TrimSpace(source.DataURL) != "" {
 		payload, err := decodeTaskDataURL(strings.TrimSpace(source.DataURL))
 		if err != nil {
@@ -213,8 +213,17 @@ func (s *Server) resolveTaskSourceImageBytes(source imageTaskSourceImage) ([]byt
 	}
 	if index := strings.Index(rawURL, "/v1/files/image/"); index >= 0 {
 		name := rawURL[index+len("/v1/files/image/"):]
-		name = strings.ReplaceAll(name, "/", "-")
-		path := s.resolveImageFilePath(name)
+		// Preserve the "<userID>/<filename>" layout instead of flattening it,
+		// so the per-user subdirectory is honored on reuse (review #7).
+		owner, filename := splitImageOwnerPath(name)
+		// Cross-tenant guard (§8): a task may only reuse source images from its
+		// own user's namespace. If the URL carries a different owner segment,
+		// refuse — otherwise userA could reuse userB's stored image by crafting
+		// a URL. A blank owner (legacy flat layout) is allowed for back-compat.
+		if owner != "" && ownerUserID != "" && owner != ownerUserID {
+			return nil, fmt.Errorf("image not found")
+		}
+		path := s.resolveImageFilePath(owner, filename)
 		if path == "" {
 			return nil, fmt.Errorf("image not found")
 		}

@@ -30,6 +30,14 @@ type imageTaskLease struct {
 	release  func()
 }
 
+// imageTaskSubscriber is one SSE listener, scoped to the user that opened the
+// stream. Events are only delivered to subscribers whose userID matches the
+// event's owner, so one tenant never sees another's task activity.
+type imageTaskSubscriber struct {
+	ch     chan imageTaskEvent
+	userID string
+}
+
 type imageTaskManager struct {
 	server        *Server
 	mu            sync.Mutex
@@ -39,7 +47,7 @@ type imageTaskManager struct {
 	tasks         map[string]*imageTask
 	order         []string
 	runningUnits  int
-	subscribers   map[int]chan imageTaskEvent
+	subscribers   map[int]*imageTaskSubscriber
 	nextSubID     int
 }
 
@@ -47,11 +55,12 @@ func newImageTaskManager(server *Server) *imageTaskManager {
 	return &imageTaskManager{
 		server:      server,
 		tasks:       map[string]*imageTask{},
-		subscribers: map[int]chan imageTaskEvent{},
+		subscribers: map[int]*imageTaskSubscriber{},
 	}
 }
 
-func (m *imageTaskManager) createTask(req createImageTaskRequest) (*imageTaskView, error) {
+func (m *imageTaskManager) createTask(userID string, req createImageTaskRequest) (*imageTaskView, error) {
+	req.UserID = userID
 	task, err := m.newTask(req)
 	if err != nil {
 		return nil, err
@@ -77,7 +86,7 @@ func (m *imageTaskManager) createTask(req createImageTaskRequest) (*imageTaskVie
 	m.tasks[task.ID] = task
 	m.order = append(m.order, task.ID)
 	view := m.buildTaskViewLocked(task)
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(task.UserID)
 	subscribers := m.subscriberChannelsLocked()
 	m.mu.Unlock()
 
@@ -93,7 +102,7 @@ func (m *imageTaskManager) createTask(req createImageTaskRequest) (*imageTaskVie
 	return view, nil
 }
 
-func (m *imageTaskManager) listTasks() ([]imageTaskView, *imageTaskSnapshot) {
+func (m *imageTaskManager) listTasks(userID string) ([]imageTaskView, *imageTaskSnapshot) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -103,40 +112,46 @@ func (m *imageTaskManager) listTasks() ([]imageTaskView, *imageTaskSnapshot) {
 		if task == nil {
 			continue
 		}
+		if task.UserID != userID {
+			continue
+		}
 		items = append(items, *m.buildTaskViewLocked(task))
 	}
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(userID)
 	return items, snapshot
 }
 
-func (m *imageTaskManager) getTask(id string) (*imageTaskView, *imageTaskSnapshot, error) {
+// getTask returns the task view + snapshot for the owning user. A task owned by
+// another user is reported as not found so one tenant can never probe another's
+// task existence.
+func (m *imageTaskManager) getTask(userID, id string) (*imageTaskView, *imageTaskSnapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	task := m.tasks[strings.TrimSpace(id)]
-	if task == nil {
+	if task == nil || task.UserID != userID {
 		return nil, nil, fmt.Errorf("task not found")
 	}
-	return m.buildTaskViewLocked(task), m.snapshotLocked(), nil
+	return m.buildTaskViewLocked(task), m.snapshotLocked(userID), nil
 }
 
-func (m *imageTaskManager) waitForTask(ctx context.Context, taskID string) (*imageTaskView, error) {
+func (m *imageTaskManager) waitForTask(ctx context.Context, userID, taskID string) (*imageTaskView, error) {
 	if taskID = strings.TrimSpace(taskID); taskID == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
-	if task, _, err := m.getTask(taskID); err == nil && isFinalImageTaskStatus(task.Status) {
+	if task, _, err := m.getTask(userID, taskID); err == nil && isFinalImageTaskStatus(task.Status) {
 		return task, nil
 	}
 
-	subID, ch := m.subscribe()
+	subID, ch := m.subscribe(userID)
 	defer m.unsubscribe(subID)
 
 	for {
 		select {
 		case <-ctx.Done():
-			task, _, err := m.getTask(taskID)
+			task, _, err := m.getTask(userID, taskID)
 			if err == nil && task != nil && task.Status == imageTaskStatusQueued {
-				_, _ = m.cancelTask(taskID)
+				_, _ = m.cancelTask(userID, taskID)
 			}
 			return nil, ctx.Err()
 		case event, ok := <-ch:
@@ -153,11 +168,11 @@ func (m *imageTaskManager) waitForTask(ctx context.Context, taskID string) (*ima
 	}
 }
 
-func (m *imageTaskManager) cancelTask(id string) (*imageTaskView, error) {
+func (m *imageTaskManager) cancelTask(userID, id string) (*imageTaskView, error) {
 	taskID := strings.TrimSpace(id)
 	m.mu.Lock()
 	task := m.tasks[taskID]
-	if task == nil {
+	if task == nil || task.UserID != userID {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("task not found")
 	}
@@ -199,7 +214,7 @@ func (m *imageTaskManager) cancelTask(id string) (*imageTaskView, error) {
 	}
 	cleanupAt := m.retentionDeadlineForTaskLocked(task)
 	view := m.buildTaskViewLocked(task)
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(task.UserID)
 	subscribers := m.subscriberChannelsLocked()
 	m.mu.Unlock()
 
@@ -214,25 +229,25 @@ func (m *imageTaskManager) cancelTask(id string) (*imageTaskView, error) {
 	return view, nil
 }
 
-func (m *imageTaskManager) subscribe() (int, <-chan imageTaskEvent) {
+func (m *imageTaskManager) subscribe(userID string) (int, <-chan imageTaskEvent) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nextSubID++
 	id := m.nextSubID
 	ch := make(chan imageTaskEvent, 32)
-	m.subscribers[id] = ch
+	m.subscribers[id] = &imageTaskSubscriber{ch: ch, userID: userID}
 	return id, ch
 }
 
 func (m *imageTaskManager) unsubscribe(id int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	ch, ok := m.subscribers[id]
+	sub, ok := m.subscribers[id]
 	if !ok {
 		return
 	}
 	delete(m.subscribers, id)
-	close(ch)
+	close(sub.ch)
 }
 
 func (m *imageTaskManager) triggerSchedule() {
@@ -255,32 +270,46 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 	m.mu.Lock()
 	expiredViews := m.expireQueuedTasksLocked(now)
 	if len(expiredViews) > 0 {
-		snapshot := m.snapshotLocked()
 		subscribers := m.subscriberChannelsLocked()
+		// Per-owner snapshot: each view's owner gets a snapshot scoped to its
+		// own tasks, so counts never leak across tenants.
+		snapshots := map[string]*imageTaskSnapshot{}
+		for _, view := range expiredViews {
+			owner := view.ownerUserID
+			if _, ok := snapshots[owner]; !ok {
+				snapshots[owner] = m.snapshotLocked(owner)
+			}
+		}
 		m.mu.Unlock()
 		for _, view := range expiredViews {
 			m.broadcast(subscribers, imageTaskEvent{
 				Type:     "task.upsert",
 				Task:     view,
-				Snapshot: snapshot,
+				Snapshot: snapshots[view.ownerUserID],
 			})
 		}
 		return true
 	}
-	removedTaskIDs := m.pruneRetainedTasksLocked(now)
-	if len(removedTaskIDs) > 0 {
-		snapshot := m.snapshotLocked()
+	removedTasks := m.pruneRetainedTasksLocked(now)
+	if len(removedTasks) > 0 {
 		subscribers := m.subscriberChannelsLocked()
+		snapshots := map[string]*imageTaskSnapshot{}
+		for _, ref := range removedTasks {
+			if _, ok := snapshots[ref.userID]; !ok {
+				snapshots[ref.userID] = m.snapshotLocked(ref.userID)
+			}
+		}
 		nextWakeAt := m.nextMaintenanceAtLocked(now)
 		m.mu.Unlock()
 		if !nextWakeAt.IsZero() {
 			m.scheduleAfter(nextWakeAt)
 		}
-		for _, taskID := range removedTaskIDs {
+		for _, ref := range removedTasks {
 			m.broadcast(subscribers, imageTaskEvent{
 				Type:     "task.remove",
-				TaskID:   taskID,
-				Snapshot: snapshot,
+				TaskID:   ref.id,
+				Snapshot: snapshots[ref.userID],
+				userID:   ref.userID,
 			})
 		}
 		return true
@@ -308,7 +337,13 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 				updatedViews = append(updatedViews, m.buildTaskViewLocked(task))
 			}
 		}
-		snapshot := m.snapshotLocked()
+		// Per-owner snapshots so tenant A never sees counts that include B's tasks.
+		perOwner := map[string]*imageTaskSnapshot{}
+		for _, view := range updatedViews {
+			if _, ok := perOwner[view.ownerUserID]; !ok {
+				perOwner[view.ownerUserID] = m.snapshotLocked(view.ownerUserID)
+			}
+		}
 		subscribers := m.subscriberChannelsLocked()
 		nextWakeAt := m.nextMaintenanceAtLocked(now)
 		m.mu.Unlock()
@@ -319,11 +354,8 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 			m.broadcast(subscribers, imageTaskEvent{
 				Type:     "task.upsert",
 				Task:     view,
-				Snapshot: snapshot,
+				Snapshot: perOwner[view.ownerUserID],
 			})
-		}
-		if len(updatedViews) == 0 {
-			m.broadcast(subscribers, imageTaskEvent{Type: "snapshot", Snapshot: snapshot})
 		}
 		return false
 	}
@@ -409,7 +441,7 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 		current.Units[unitIndex].Cancel = cancel
 		m.runningUnits++
 		view := m.buildTaskViewLocked(current)
-		snapshot := m.snapshotLocked()
+		snapshot := m.snapshotLocked(current.UserID)
 		subscribers := m.subscriberChannelsLocked()
 		m.mu.Unlock()
 
@@ -555,7 +587,7 @@ func (m *imageTaskManager) runUnit(taskID string, unitIndex int, lease *imageTas
 	}
 
 	view := m.buildTaskViewLocked(task)
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(task.UserID)
 	subscribers := m.subscriberChannelsLocked()
 	cleanupAt := m.retentionDeadlineForTaskLocked(task)
 	m.mu.Unlock()
@@ -589,7 +621,7 @@ func (m *imageTaskManager) failTask(taskID string, err error) {
 		}
 	}
 	view := m.buildTaskViewLocked(task)
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(task.UserID)
 	subscribers := m.subscriberChannelsLocked()
 	cleanupAt := m.retentionDeadlineForTaskLocked(task)
 	m.mu.Unlock()
@@ -617,7 +649,7 @@ func (m *imageTaskManager) updateTaskBlocker(taskID string, blocker imageTaskBlo
 		task.Blockers = []imageTaskBlocker{blocker}
 	}
 	view := m.buildTaskViewLocked(task)
-	snapshot := m.snapshotLocked()
+	snapshot := m.snapshotLocked(task.UserID)
 	subscribers := m.subscriberChannelsLocked()
 	m.mu.Unlock()
 
@@ -992,12 +1024,19 @@ func (m *imageTaskManager) nextMaintenanceAtLocked(now time.Time) time.Time {
 	}
 }
 
-func (m *imageTaskManager) pruneRetainedTasksLocked(now time.Time) []string {
+// removedTaskRef pairs a pruned task's ID with its owner so the removal can be
+// broadcast only to that owner's subscribers.
+type removedTaskRef struct {
+	id     string
+	userID string
+}
+
+func (m *imageTaskManager) pruneRetainedTasksLocked(now time.Time) []removedTaskRef {
 	if len(m.order) == 0 {
 		return nil
 	}
 	nextOrder := make([]string, 0, len(m.order))
-	removed := make([]string, 0)
+	removed := make([]removedTaskRef, 0)
 	for _, id := range m.order {
 		task := m.tasks[id]
 		if task == nil {
@@ -1005,8 +1044,8 @@ func (m *imageTaskManager) pruneRetainedTasksLocked(now time.Time) []string {
 		}
 		cleanupAt := m.retentionDeadlineForTaskLocked(task)
 		if !cleanupAt.IsZero() && !cleanupAt.After(now) {
+			removed = append(removed, removedTaskRef{id: id, userID: task.UserID})
 			delete(m.tasks, id)
-			removed = append(removed, id)
 			continue
 		}
 		nextOrder = append(nextOrder, id)
@@ -1050,6 +1089,7 @@ func (m *imageTaskManager) buildTaskViewLocked(task *imageTask) *imageTaskView {
 	}
 
 	view := &imageTaskView{
+		ownerUserID:     task.UserID,
 		ID:              task.ID,
 		ConversationID:  task.ConversationID,
 		TurnID:          task.TurnID,
@@ -1074,7 +1114,7 @@ func (m *imageTaskManager) buildTaskViewLocked(task *imageTask) *imageTaskView {
 	return view
 }
 
-func (m *imageTaskManager) snapshotLocked() *imageTaskSnapshot {
+func (m *imageTaskManager) snapshotLocked(userID string) *imageTaskSnapshot {
 	queued := 0
 	total := 0
 	activeSources := imageTaskSourceSnapshot{}
@@ -1082,6 +1122,9 @@ func (m *imageTaskManager) snapshotLocked() *imageTaskSnapshot {
 	for _, id := range m.order {
 		task := m.tasks[id]
 		if task == nil {
+			continue
+		}
+		if task.UserID != userID {
 			continue
 		}
 		total++
@@ -1123,18 +1166,32 @@ func (m *imageTaskManager) snapshotLocked() *imageTaskSnapshot {
 	}
 }
 
-func (m *imageTaskManager) subscriberChannelsLocked() []chan imageTaskEvent {
-	channels := make([]chan imageTaskEvent, 0, len(m.subscribers))
-	for _, ch := range m.subscribers {
-		channels = append(channels, ch)
+func (m *imageTaskManager) subscriberChannelsLocked() []*imageTaskSubscriber {
+	subs := make([]*imageTaskSubscriber, 0, len(m.subscribers))
+	for _, sub := range m.subscribers {
+		subs = append(subs, sub)
 	}
-	return channels
+	return subs
 }
 
-func (m *imageTaskManager) broadcast(subscribers []chan imageTaskEvent, event imageTaskEvent) {
-	for _, ch := range subscribers {
+// broadcast delivers an event only to subscribers that own it. event.userID is
+// the task owner; a subscriber receives it only when its userID matches, so one
+// tenant never sees another's task stream. Events with an empty owner (rare,
+// e.g. legacy single-tenant) are delivered to all subscribers.
+func (m *imageTaskManager) broadcast(subscribers []*imageTaskSubscriber, event imageTaskEvent) {
+	// Derive the owning userID: explicit event.userID wins, otherwise fall back
+	// to the task view's owner. This lets the many call sites that build an event
+	// from a view stay unchanged — the owner is carried on the view.
+	owner := event.userID
+	if owner == "" && event.Task != nil {
+		owner = event.Task.ownerUserID
+	}
+	for _, sub := range subscribers {
+		if owner != "" && sub.userID != owner {
+			continue
+		}
 		select {
-		case ch <- event:
+		case sub.ch <- event:
 		default:
 		}
 	}

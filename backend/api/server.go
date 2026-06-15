@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -22,6 +23,8 @@ import (
 	"chatgpt2api/internal/buildinfo"
 	"chatgpt2api/internal/cliproxy"
 	"chatgpt2api/internal/config"
+	"chatgpt2api/internal/credential"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/middleware"
 	"chatgpt2api/internal/newapi"
 	"chatgpt2api/internal/sub2api"
@@ -42,7 +45,7 @@ type Server struct {
 	imageTasks             *imageTaskManager
 	officialClientFactory  func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient
 	responsesClientFactory func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient
-	cpaClientFactory       func(baseURL, apiKey string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient
+	cpaClientFactory       func(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient
 	newAPIClientFactory    func(cfg *config.Config) *newapi.Client
 	sub2apiClientFactory   func(cfg *config.Config) *sub2api.Client
 	sourceClientMu         sync.Mutex
@@ -50,6 +53,17 @@ type Server struct {
 	cachedNewAPIKey        string
 	cachedSub2APIClient    *sub2api.Client
 	cachedSub2APIKey       string
+
+	// Multi-tenant identity (phase 1). sessionManager is always present;
+	// entryVerifier is nil until an RS256 public key is configured.
+	sessionManager *identity.SessionManager
+	entryVerifier  *identity.EntryVerifier
+	jtiStore       identity.JTIStore
+
+	// Multi-tenant credential resolution (phase 2). credService is nil until a
+	// credential endpoint is configured; when nil the pipeline falls back to the
+	// global [cpa] config so single-tenant/dev keeps working.
+	credService *credential.Service
 }
 
 type requestError struct {
@@ -98,8 +112,8 @@ func NewServer(cfg *config.Config, store *accounts.Store, syncClient *cliproxy.C
 		responsesClientFactory: func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
 			return handler.NewResponsesClientWithProxyAndConfig(accessToken, proxyURL, authData, requestConfig)
 		},
-		cpaClientFactory: func(baseURL, apiKey string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
-			return newCPAImageClient(baseURL, apiKey, timeout, routeStrategy)
+		cpaClientFactory: func(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
+			return newCPAImageClientWithModel(baseURL, apiKey, imageModel, timeout, routeStrategy)
 		},
 		newAPIClientFactory: func(cfg *config.Config) *newapi.Client {
 			timeout := time.Duration(max(10, cfg.NewAPI.RequestTimeout)) * time.Second
@@ -128,7 +142,70 @@ func NewServer(cfg *config.Config, store *accounts.Store, syncClient *cliproxy.C
 		},
 	}
 	server.imageTasks = newImageTaskManager(server)
+	server.initIdentity()
+	server.initCredential()
 	return server
+}
+
+// initIdentity builds the session manager and (if a public key is configured)
+// the entry-ticket verifier. The session manager always exists: a missing
+// session_secret falls back to the legacy auth_key so single-tenant/dev runs
+// still work. The entry verifier is optional — without a configured public key,
+// POST /auth/session returns 503 and only pre-existing sessions/dev auth apply.
+func (s *Server) initIdentity() {
+	secret := strings.TrimSpace(s.cfg.Identity.SessionSecret)
+	if secret == "" {
+		secret = strings.TrimSpace(s.cfg.App.AuthKey)
+	}
+	if secret == "" {
+		secret = "chatgpt-image-studio-default-session-secret"
+	}
+	if sm, err := identity.NewSessionManager(secret, s.cfg.SessionTTL()); err == nil {
+		s.sessionManager = sm
+	}
+
+	s.jtiStore = identity.NewMemoryJTIStore()
+
+	keyPath := strings.TrimSpace(s.cfg.Identity.JWTPublicKeyPath)
+	if keyPath == "" {
+		return
+	}
+	resolved := s.cfg.ResolvePath(keyPath)
+	verifier, err := identity.NewEntryVerifierFromFile(
+		resolved,
+		s.cfg.Identity.JWTIssuer,
+		s.cfg.Identity.JWTAudience,
+		s.jtiStore,
+	)
+	if err != nil {
+		slog.Warn("identity: entry-ticket verifier disabled", slog.String("path", resolved), slog.Any("error", err))
+		return
+	}
+	s.entryVerifier = verifier
+}
+
+// initCredential builds the per-user credential service when the mother-system
+// callback is configured ([credential] endpoint_base + internal_secret). When
+// unconfigured, credService stays nil and the image pipeline falls back to the
+// global [cpa] config so single-tenant/dev deployments keep working.
+func (s *Server) initCredential() {
+	base := strings.TrimSpace(s.cfg.Credential.EndpointBase)
+	secret := strings.TrimSpace(s.cfg.Credential.InternalSecret)
+	if base == "" || secret == "" {
+		return
+	}
+	resolver, err := credential.NewHTTPResolver(credential.HTTPResolverConfig{
+		EndpointBase:   base,
+		InternalSecret: secret,
+		GatewayBaseURL: strings.TrimSpace(s.cfg.Credential.GatewayBaseURL),
+		RequestTimeout: s.cfg.CredentialRequestTimeout(),
+		CacheTTL:       s.cfg.CredentialCacheTTL(),
+	})
+	if err != nil {
+		slog.Warn("credential: resolver disabled", slog.Any("error", err))
+		return
+	}
+	s.credService = credential.NewService(resolver, credential.NewMemorySelectionStore())
 }
 
 func (s *Server) getStore() *accounts.Store {
@@ -377,6 +454,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.Handle("POST /auth/login", http.HandlerFunc(s.handleLogin))
+	mux.Handle("POST /auth/session", http.HandlerFunc(s.handleSession))
 	mux.Handle("GET /version", http.HandlerFunc(s.handleVersion))
 	mux.Handle("GET /health", http.HandlerFunc(handleHealth))
 
@@ -411,6 +489,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleGetImageConversation)))
 	mux.Handle("PUT /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleSaveImageConversation)))
 	mux.Handle("DELETE /api/image/conversations/{id}", s.requireUIAuth(http.HandlerFunc(s.handleDeleteImageConversation)))
+	mux.Handle("GET /api/image/credential/keys", s.requireUIAuth(http.HandlerFunc(s.handleListCredentialKeys)))
+	mux.Handle("GET /api/image/credential/current", s.requireUIAuth(http.HandlerFunc(s.handleGetCurrentCredential)))
+	mux.Handle("PUT /api/image/credential/current", s.requireUIAuth(http.HandlerFunc(s.handleSetCurrentCredential)))
 	mux.Handle("POST /api/image/tasks", s.requireUIAuth(http.HandlerFunc(s.handleCreateImageTask)))
 	mux.Handle("GET /api/image/tasks", s.requireUIAuth(http.HandlerFunc(s.handleListImageTasks)))
 	mux.Handle("GET /api/image/tasks/snapshot", s.requireUIAuth(http.HandlerFunc(s.handleImageTaskSnapshot)))
@@ -423,7 +504,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/chat/completions", s.requireImageAuth(http.HandlerFunc(s.handleImageChatCompletions)))
 	mux.Handle("POST /v1/responses", s.requireImageAuth(http.HandlerFunc(s.handleImageResponses)))
 	mux.Handle("GET /v1/models", s.requireImageAuth(http.HandlerFunc(s.handleModels)))
-	mux.Handle("GET /v1/files/image/", http.HandlerFunc(s.handleImageFile))
+	mux.Handle("GET /v1/files/image/", s.requireImageAuth(http.HandlerFunc(s.handleImageFile)))
 
 	mux.Handle("/", http.HandlerFunc(s.handleWebApp))
 
@@ -448,6 +529,72 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 		"commit":    buildinfo.Commit,
 		"buildTime": buildinfo.BuildTime,
 	})
+}
+
+// handleSession exchanges a one-time RS256 entry ticket (minted by the mother
+// system) for an image-studio session cookie. The ticket is read from the
+// Authorization: Bearer header or a "ticket" form/query field. On success it
+// sets an HttpOnly session cookie scoped to the public base path.
+//
+// Backend route: POST /auth/session. Browser-facing path: POST
+// /image-studio/auth/session (reverse proxy strips the prefix; see §0.1).
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if s.entryVerifier == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "entry ticket verification is not configured"})
+		return
+	}
+	if s.sessionManager == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "session manager is not configured"})
+		return
+	}
+
+	ticket := bearerFromRequest(r)
+	if ticket == "" {
+		ticket = strings.TrimSpace(r.FormValue("ticket"))
+	}
+	if ticket == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing entry ticket"})
+		return
+	}
+
+	userID, err := s.entryVerifier.Verify(r.Context(), ticket)
+	if err != nil {
+		// Both invalid and replayed tickets map to 401; the distinction is
+		// useful for logs but not for the client.
+		slog.Warn("identity: entry ticket rejected", slog.Any("error", err))
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "entry ticket invalid"})
+		return
+	}
+
+	token, err := s.sessionManager.Mint(userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to mint session"})
+		return
+	}
+
+	s.setSessionCookie(w, r, token)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// setSessionCookie writes the HttpOnly session cookie. Path is scoped to the
+// public base path so the cookie is not exposed to the mother system's other
+// routes. Secure is set when the request arrived over TLS (directly or via a
+// trusted X-Forwarded-Proto from the reverse proxy).
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	path := s.cfg.PublicBasePath()
+	if path == "" {
+		path = "/"
+	}
+	cookie := &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     path,
+		HttpOnly: true,
+		Secure:   requestIsTLS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(s.cfg.SessionTTL().Seconds()),
+	}
+	http.SetCookie(w, cookie)
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
@@ -1054,22 +1201,46 @@ func (s *Server) newResponsesWorkflowClient(accessToken string, authData map[str
 	)
 }
 
-func (s *Server) newCPAWorkflowClient() cpaRouteAwareImageWorkflowClient {
+// newCPAWorkflowClient builds a CPA image client bound to a specific user's
+// credential (base URL + api-key + model). In the multi-tenant model the
+// credential is resolved per request from the userID; the legacy Studio path
+// passes a config-derived credential (removed in phase 7).
+func (s *Server) newCPAWorkflowClient(cred credential.Credential) cpaRouteAwareImageWorkflowClient {
 	timeout := time.Duration(max(10, s.cfg.CPAImageRequestTimeout())) * time.Second
+	baseURL := strings.TrimSpace(cred.BaseURL)
+	if baseURL == "" {
+		baseURL = s.cfg.CPAImageBaseURL()
+	}
+	apiKey := strings.TrimSpace(cred.APIKey)
+	if apiKey == "" {
+		apiKey = s.cfg.CPAImageAPIKey()
+	}
+	model := strings.TrimSpace(cred.Model)
 	if s != nil && s.cpaClientFactory != nil {
 		return s.cpaClientFactory(
-			s.cfg.CPAImageBaseURL(),
-			s.cfg.CPAImageAPIKey(),
+			baseURL,
+			apiKey,
+			model,
 			timeout,
 			s.cfg.CPAImageRouteStrategy(),
 		)
 	}
-	return newCPAImageClient(
-		s.cfg.CPAImageBaseURL(),
-		s.cfg.CPAImageAPIKey(),
+	return newCPAImageClientWithModel(
+		baseURL,
+		apiKey,
+		model,
 		timeout,
 		s.cfg.CPAImageRouteStrategy(),
 	)
+}
+
+// cpaCredentialFromConfig builds a credential from global CPA config, used by
+// the legacy Studio fallback path that has no per-user credential.
+func (s *Server) cpaCredentialFromConfig() credential.Credential {
+	return credential.Credential{
+		BaseURL: s.cfg.CPAImageBaseURL(),
+		APIKey:  s.cfg.CPAImageAPIKey(),
+	}
 }
 
 func resolveImageAcquireError(mode string, err, lastRetryableErr error) error {
@@ -1088,6 +1259,45 @@ func resolveImageAcquireError(mode string, err, lastRetryableErr error) error {
 	return err
 }
 
+// resolveImageCredential returns the channel credential for the current request.
+// In multi-tenant mode (credService configured) it resolves the per-user
+// remembered key; the userID comes from the request context (injected by the
+// session middleware, or by the async task executor — see phase 4). When no
+// credService is configured it falls back to the global [cpa] config so
+// single-tenant/dev deployments keep working.
+//
+// Returned errors are *requestError values with stable codes the frontend keys
+// on to drive the picker / guidance UI.
+func (s *Server) resolveImageCredential(ctx context.Context) (credential.Credential, error) {
+	if s.credService == nil {
+		// Single-tenant fallback: global config must be configured.
+		if !s.cfg.CPAImageConfigured() {
+			return credential.Credential{}, newRequestError("cpa_image_not_configured", "CPA 图片接口还未配置，请先在配置管理中设置 CPA base_url 与 api_key")
+		}
+		return credential.Credential{
+			BaseURL: s.cfg.CPAImageBaseURL(),
+			APIKey:  s.cfg.CPAImageAPIKey(),
+		}, nil
+	}
+
+	userID, ok := identity.UserIDFromContext(ctx)
+	if !ok {
+		return credential.Credential{}, newRequestError("user_unidentified", "无法识别当前用户身份，请重新进入图片工作台")
+	}
+	cred, err := s.credService.ResolveForUser(ctx, userID)
+	if err == nil {
+		return cred, nil
+	}
+	switch {
+	case errors.Is(err, credential.ErrNoSelection), errors.Is(err, credential.ErrNoCredential):
+		return credential.Credential{}, newRequestError("image_key_not_selected", "请先在图片工作台选择一个可用的 API Key")
+	case errors.Is(err, credential.ErrUpstreamUnavailable):
+		return credential.Credential{}, newRequestError("credential_service_unavailable", "凭证服务暂时不可用，请稍后重试")
+	default:
+		return credential.Credential{}, newRequestError("image_key_unavailable", "当前没有可用的图片 API Key，请回到主系统创建或重新选择")
+	}
+}
+
 func (s *Server) runPureCPAImageRequest(
 	ctx context.Context,
 	operation string,
@@ -1099,8 +1309,8 @@ func (s *Server) runPureCPAImageRequest(
 	r *http.Request,
 ) ([]map[string]any, error) {
 	startedAt := time.Now()
-	if !s.cfg.CPAImageConfigured() {
-		err := newRequestError("cpa_image_not_configured", "CPA 图片接口还未配置，请先在配置管理中设置 CPA base_url 与 api_key")
+	cred, credErr := s.resolveImageCredential(ctx)
+	if credErr != nil {
 		entry := imageRequestLogEntry{
 			StartedAt:      startedAt.Format(time.RFC3339Nano),
 			FinishedAt:     time.Now().Format(time.RFC3339Nano),
@@ -1113,11 +1323,14 @@ func (s *Server) runPureCPAImageRequest(
 			RequestedModel: requestedModel,
 			Preferred:      preferredAccount,
 			Success:        false,
-			Error:          err.Error(),
+			Error:          credErr.Error(),
+		}
+		if requestErr, ok := credErr.(*requestError); ok {
+			entry.ErrorCode = requestErr.code
 		}
 		metadata.applyTo(&entry)
 		s.logImageRequest(entry)
-		return nil, err
+		return nil, credErr
 	}
 
 	admissionInfo, releaseAdmission, admissionErr := s.acquireImageAdmission(ctx)
@@ -1154,8 +1367,8 @@ func (s *Server) runPureCPAImageRequest(
 	defer releaseAdmission()
 	ctx = withImageAdmissionInfo(ctx, admissionInfo)
 
-	client := s.newCPAWorkflowClient()
-	upstreamModel := cpaFixedImageModel
+	client := s.newCPAWorkflowClient(cred)
+	upstreamModel := firstNonEmpty(strings.TrimSpace(cred.Model), cpaFixedImageModel)
 	results, err := run(client, upstreamModel)
 	cpaSubroute := client.LastRoute()
 	if label := strings.TrimSpace(client.LastModelLabel()); label != "" {
@@ -1207,7 +1420,8 @@ func (s *Server) runPureCPAImageRequest(
 	}
 	metadata.applyTo(&entry)
 	s.logImageRequest(entry)
-	return buildImageResponse(r, client, results, responseFormat, "", s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), nil
+	cpaUserID, _ := identity.UserIDFromContext(ctx)
+	return buildImageResponse(r, client, results, responseFormat, "", cpaUserID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir), s.cfg.PublicBasePath()), nil
 }
 
 func (s *Server) runImageRequest(ctx context.Context, authFile *accounts.LocalAuth, account accounts.PublicAccount, releaseLease func(), routingDecision accounts.ImageAccountRoutingDecision, operation, responseFormat string, preferredAccount bool, requestedModel string, responsesEligible bool, metadata imageRequestMetadata, run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error), r *http.Request) ([]map[string]any, bool, error) {
@@ -1351,7 +1565,10 @@ func (s *Server) runImageRequestWithAdmission(ctx context.Context, authFile *acc
 			s.logImageRequest(entry)
 			return nil, false, err
 		}
-		client = s.newCPAWorkflowClient()
+		client = s.newCPAWorkflowClient(credential.Credential{
+			BaseURL: s.cfg.CPAImageBaseURL(),
+			APIKey:  s.cfg.CPAImageAPIKey(),
+		})
 		upstreamModel = cpaFixedImageModel
 		route = "cpa"
 		direction = "cpa"
@@ -1472,7 +1689,8 @@ func (s *Server) runImageRequestWithAdmission(ctx context.Context, authFile *acc
 	applyImageRoutingLogFields(routingDecision, &entry)
 	metadata.applyTo(&entry)
 	s.logImageRequest(entry)
-	return buildImageResponse(r, client, results, responseFormat, account.ID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir)), false, nil
+	studioUserID, _ := identity.UserIDFromContext(ctx)
+	return buildImageResponse(r, client, results, responseFormat, account.ID, studioUserID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir), s.cfg.PublicBasePath()), false, nil
 }
 
 func normalizeRequestedImageModel(requested, fallback string) string {
@@ -1573,24 +1791,61 @@ func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, asset)
 }
 
+// sessionCookieName is the HttpOnly cookie carrying image-studio's own session.
+const sessionCookieName = "studio_sid"
+
+// legacyDefaultUserID is the tenant assigned to requests authorized via the
+// legacy single-tenant bearer key (no session cookie). In single-tenant/dev
+// mode every request maps to this one user. Removed in phase 7.
+const legacyDefaultUserID = "default"
+
+// requireUIAuth gates the management/UI API. In the multi-tenant model it
+// accepts a valid session cookie; for backward compatibility (single-tenant,
+// dev, tests) it also accepts the legacy auth_key bearer. Either way the
+// resolved userID is injected into the request context.
 func (s *Server) requireUIAuth(next http.Handler) http.Handler {
+	return s.requireSession(next, nil)
+}
+
+// requireImageAuth gates the OpenAI-compatible /v1 image API. Same as
+// requireUIAuth but the legacy fallback additionally accepts the configured
+// api_key comma-list (used by external API clients today).
+func (s *Server) requireImageAuth(next http.Handler) http.Handler {
+	return s.requireSession(next, parseKeys(s.cfg.App.APIKey))
+}
+
+// requireSession resolves the caller's userID (session cookie first, then
+// legacy bearer keys) and injects it into the request context. On failure it
+// returns 401. extraLegacyKeys are additional bearer keys accepted on the
+// legacy path (beyond auth_key).
+func (s *Server) requireSession(next http.Handler, extraLegacyKeys []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.hasExactBearer(r, s.cfg.App.AuthKey) {
+		userID, ok := s.resolveUserID(r, extraLegacyKeys)
+		if !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authorization is invalid"})
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(identity.WithUserID(r.Context(), userID)))
 	})
 }
 
-func (s *Server) requireImageAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.hasAnyBearer(r, append([]string{s.cfg.App.AuthKey}, parseKeys(s.cfg.App.APIKey)...)...) {
-			next.ServeHTTP(w, r)
-			return
+// resolveUserID returns the authenticated userID and whether the request is
+// authorized. Resolution order:
+//  1. Valid session cookie (studio_sid) → its userID (multi-tenant path).
+//  2. Legacy bearer matching auth_key or one of extraLegacyKeys → legacyDefaultUserID.
+func (s *Server) resolveUserID(r *http.Request, extraLegacyKeys []string) (string, bool) {
+	if s.sessionManager != nil {
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			if userID, verr := s.sessionManager.Verify(cookie.Value); verr == nil {
+				return userID, true
+			}
 		}
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authorization is invalid"})
-	})
+	}
+	legacyKeys := append([]string{s.cfg.App.AuthKey}, extraLegacyKeys...)
+	if s.hasAnyBearer(r, legacyKeys...) {
+		return legacyDefaultUserID, true
+	}
+	return "", false
 }
 
 func (s *Server) hasAnyBearer(r *http.Request, keys ...string) bool {
@@ -1608,6 +1863,25 @@ func (s *Server) hasAnyBearer(r *http.Request, keys ...string) bool {
 
 func (s *Server) hasExactBearer(r *http.Request, key string) bool {
 	return strings.TrimSpace(key) != "" && bearerFromRequest(r) == strings.TrimSpace(key)
+}
+
+// requestIsTLS reports whether the original client connection used HTTPS,
+// honoring X-Forwarded-Proto set by a trusted reverse proxy. Used to decide the
+// Secure cookie attribute so local HTTP dev still works.
+func requestIsTLS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+	// X-Forwarded-Proto may be a comma-separated list; the first entry is the
+	// original client scheme.
+	if comma := strings.Index(proto, ","); comma >= 0 {
+		proto = strings.TrimSpace(proto[:comma])
+	}
+	return proto == "https"
 }
 
 func bearerFromRequest(r *http.Request) string {

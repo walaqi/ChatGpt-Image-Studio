@@ -19,6 +19,7 @@ import (
 type cpaImageClient struct {
 	baseURL       string
 	apiKey        string
+	imageModel    string // upstream image model; falls back to cpaFixedImageModel when empty
 	httpClient    *http.Client
 	routeStrategy string
 	lastRoute     string
@@ -29,17 +30,34 @@ type cpaImageClient struct {
 const maxCPAResponsesSSELineBytes = 128 << 20
 
 func newCPAImageClient(baseURL, apiKey string, timeout time.Duration, routeStrategy string) *cpaImageClient {
+	return newCPAImageClientWithModel(baseURL, apiKey, "", timeout, routeStrategy)
+}
+
+// newCPAImageClientWithModel builds a client whose upstream image model is
+// driven by the per-user credential (mother system's returned model). An empty
+// model falls back to cpaFixedImageModel for backward compatibility.
+func newCPAImageClientWithModel(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) *cpaImageClient {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	return &cpaImageClient{
 		baseURL:       strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:        strings.TrimSpace(apiKey),
+		imageModel:    strings.TrimSpace(imageModel),
 		routeStrategy: normalizeCPAImageClientRouteStrategy(routeStrategy),
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
 	}
+}
+
+// imgModel returns the upstream image model: the per-user configured value when
+// set, otherwise the baked-in default.
+func (c *cpaImageClient) imgModel() string {
+	if model := strings.TrimSpace(c.imageModel); model != "" {
+		return model
+	}
+	return cpaFixedImageModel
 }
 
 func (c *cpaImageClient) LastRoute() string {
@@ -247,12 +265,13 @@ func (c *cpaImageClient) executeJSONRequest(ctx context.Context, path string, bo
 
 func (c *cpaImageClient) setLastRoute(route string) {
 	c.lastRoute = strings.TrimSpace(route)
-	c.lastToolModel = cpaFixedImageModel
+	imageModel := c.imgModel()
+	c.lastToolModel = imageModel
 	if c.lastRoute == "codex_responses" {
-		c.lastModel = cpaResponsesMainModel + " (tool: " + cpaFixedImageModel + ")"
+		c.lastModel = cpaResponsesMainModel + " (tool: " + imageModel + ")"
 		return
 	}
-	c.lastModel = cpaFixedImageModel
+	c.lastModel = imageModel
 }
 
 func (c *cpaImageClient) parseImageAPIResponse(resp *http.Response) ([]handler.ImageResult, error) {
@@ -435,7 +454,7 @@ func (c *cpaImageClient) buildResponsesRequest(prompt string, images [][]byte, m
 	tool := map[string]any{
 		"type":          "image_generation",
 		"action":        action,
-		"model":         cpaFixedImageModel,
+		"model":         c.imgModel(),
 		"output_format": "png",
 	}
 	if trimmedSize := strings.TrimSpace(size); trimmedSize != "" {
