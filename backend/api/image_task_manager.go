@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"chatgpt2api/internal/accounts"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/imagehistory"
 )
 
@@ -28,6 +29,10 @@ type imageTaskLease struct {
 	account  accounts.PublicAccount
 	decision accounts.ImageAccountRoutingDecision
 	release  func()
+	// cpa marks a multi-tenant lease: execution resolves a per-user CPA
+	// credential from the task's userID instead of holding an account-pool
+	// lease. auth/account/release are unused for cpa leases.
+	cpa bool
 }
 
 // imageTaskSubscriber is one SSE listener, scoped to the user that opened the
@@ -427,7 +432,11 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 			return false
 		}
 		now := time.Now().UTC()
-		runCtx, cancel := context.WithCancel(context.Background())
+		// Carry the task's owner identity into the execution context so the
+		// async path resolves the correct per-user CPA credential (§4.4). The
+		// sync /v1 path gets userID from the session middleware; tasks run on a
+		// background context, so we inject it here instead.
+		runCtx, cancel := context.WithCancel(identity.WithUserID(context.Background(), current.UserID))
 		if current.StartedAt.IsZero() {
 			current.StartedAt = now
 		}
@@ -690,6 +699,14 @@ func (m *imageTaskManager) removeTaskIDFromOrderLocked(taskID string) {
 }
 
 func (m *imageTaskManager) acquireLeaseForTask(task *imageTask) (*imageTaskLease, imageTaskBlocker, error) {
+	// Multi-tenant CPA mode: execution resolves a per-user credential from the
+	// task's userID (see executeImageTaskUnit), so there is no account-pool
+	// lease to acquire. Return a marker lease; concurrency is still bounded by
+	// the task manager's runningUnits cap.
+	if m.server.configuredImageMode() == "cpa" {
+		return &imageTaskLease{cpa: true}, imageTaskBlocker{}, nil
+	}
+
 	store := m.server.getStore()
 	allowDisabled := m.server.allowDisabledStudioImageAccounts()
 
@@ -752,6 +769,14 @@ func (m *imageTaskManager) acquireLeaseForTask(task *imageTask) (*imageTaskLease
 }
 
 func (m *imageTaskManager) hasPotentialCompatibleAccounts(task *imageTask) (bool, error) {
+	// Multi-tenant CPA mode has no account pool. Credential availability is
+	// resolved per-user at execution time (resolveImageCredential); a missing
+	// or unusable key surfaces as a task failure with a stable error code, not
+	// a creation-time rejection. So task creation is always permitted here.
+	if m.server.configuredImageMode() == "cpa" {
+		return true, nil
+	}
+
 	store := m.server.getStore()
 	allowDisabled := m.server.allowDisabledStudioImageAccounts()
 

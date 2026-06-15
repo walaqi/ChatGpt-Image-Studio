@@ -1130,7 +1130,7 @@ func (s *Server) withImageResultsFilteredWithMetadata(
 	store := s.getStore()
 	mode := s.configuredImageMode()
 	if mode == "cpa" {
-		return s.runPureCPAImageRequest(ctx, operation, responseFormat, requestedModel, strings.TrimSpace(preferredAccountID) != "", metadata, run, r)
+		return s.runPureCPAImageRequest(ctx, operation, responseFormat, requestedModel, strings.TrimSpace(preferredAccountID) != "", metadata, run, r, true)
 	}
 	policy, err := parseRequestImageAccountRoutingPolicy(r)
 	if err != nil {
@@ -1298,6 +1298,10 @@ func (s *Server) resolveImageCredential(ctx context.Context) (credential.Credent
 	}
 }
 
+// runPureCPAImageRequest executes one image operation against the per-user CPA
+// credential resolved from ctx. useAdmission gates the global image concurrency
+// queue: the sync /v1 path passes true; the async task path passes false because
+// the task manager already bounds concurrency via runningUnits.
 func (s *Server) runPureCPAImageRequest(
 	ctx context.Context,
 	operation string,
@@ -1307,6 +1311,7 @@ func (s *Server) runPureCPAImageRequest(
 	metadata imageRequestMetadata,
 	run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error),
 	r *http.Request,
+	useAdmission bool,
 ) ([]map[string]any, error) {
 	startedAt := time.Now()
 	cred, credErr := s.resolveImageCredential(ctx)
@@ -1333,39 +1338,41 @@ func (s *Server) runPureCPAImageRequest(
 		return nil, credErr
 	}
 
-	admissionInfo, releaseAdmission, admissionErr := s.acquireImageAdmission(ctx)
-	if admissionErr != nil {
-		err := admissionErr
-		if errors.Is(admissionErr, errImageAdmissionQueueFull) {
-			err = newRequestError("image_queue_full", "当前图片请求排队已满，请稍后再试")
-		} else if errors.Is(admissionErr, errImageAdmissionQueueTimeout) {
-			err = newRequestError("image_queue_timeout", "当前图片请求排队超时，请稍后再试")
+	if useAdmission {
+		admissionInfo, releaseAdmission, admissionErr := s.acquireImageAdmission(ctx)
+		if admissionErr != nil {
+			err := admissionErr
+			if errors.Is(admissionErr, errImageAdmissionQueueFull) {
+				err = newRequestError("image_queue_full", "当前图片请求排队已满，请稍后再试")
+			} else if errors.Is(admissionErr, errImageAdmissionQueueTimeout) {
+				err = newRequestError("image_queue_timeout", "当前图片请求排队超时，请稍后再试")
+			}
+			entry := imageRequestLogEntry{
+				StartedAt:            startedAt.Format(time.RFC3339Nano),
+				FinishedAt:           time.Now().Format(time.RFC3339Nano),
+				Endpoint:             r.URL.Path,
+				Operation:            operation,
+				ImageMode:            "cpa",
+				Direction:            "cpa",
+				Route:                "cpa",
+				CPASubroute:          s.cfg.CPAImageRouteStrategy(),
+				RequestedModel:       requestedModel,
+				Preferred:            preferredAccount,
+				Success:              false,
+				Error:                err.Error(),
+				QueueWaitMS:          admissionInfo.QueueWaitMS,
+				InflightCountAtStart: admissionInfo.InflightCountAtStart,
+			}
+			if requestErr, ok := err.(*requestError); ok {
+				entry.ErrorCode = requestErr.code
+			}
+			metadata.applyTo(&entry)
+			s.logImageRequest(entry)
+			return nil, err
 		}
-		entry := imageRequestLogEntry{
-			StartedAt:            startedAt.Format(time.RFC3339Nano),
-			FinishedAt:           time.Now().Format(time.RFC3339Nano),
-			Endpoint:             r.URL.Path,
-			Operation:            operation,
-			ImageMode:            "cpa",
-			Direction:            "cpa",
-			Route:                "cpa",
-			CPASubroute:          s.cfg.CPAImageRouteStrategy(),
-			RequestedModel:       requestedModel,
-			Preferred:            preferredAccount,
-			Success:              false,
-			Error:                err.Error(),
-			QueueWaitMS:          admissionInfo.QueueWaitMS,
-			InflightCountAtStart: admissionInfo.InflightCountAtStart,
-		}
-		if requestErr, ok := err.(*requestError); ok {
-			entry.ErrorCode = requestErr.code
-		}
-		metadata.applyTo(&entry)
-		s.logImageRequest(entry)
-		return nil, err
+		defer releaseAdmission()
+		ctx = withImageAdmissionInfo(ctx, admissionInfo)
 	}
-	defer releaseAdmission()
-	ctx = withImageAdmissionInfo(ctx, admissionInfo)
 
 	client := s.newCPAWorkflowClient(cred)
 	upstreamModel := firstNonEmpty(strings.TrimSpace(cred.Model), cpaFixedImageModel)
@@ -1401,7 +1408,7 @@ func (s *Server) runPureCPAImageRequest(
 		return nil, err
 	}
 
-	admissionInfo = imageAdmissionFromContext(ctx)
+	admissionInfo := imageAdmissionFromContext(ctx)
 	entry := imageRequestLogEntry{
 		StartedAt:            startedAt.Format(time.RFC3339Nano),
 		FinishedAt:           time.Now().Format(time.RFC3339Nano),
