@@ -1,14 +1,9 @@
 package api
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"strings"
 
 	"chatgpt2api/internal/config"
-	"chatgpt2api/internal/configstore"
 )
 
 type configPayload struct {
@@ -107,151 +102,6 @@ type configPayload struct {
 	Paths config.Paths `json:"paths"`
 }
 
-type configSaveTarget struct {
-	ConfigBackend string
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
-	RedisPrefix   string
-}
-
-func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.buildConfigPayload())
-}
-
-func (s *Server) handleGetDefaultConfig(w http.ResponseWriter, r *http.Request) {
-	defaultCfg, err := config.LoadDefaults(s.cfg.Paths())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, s.buildConfigPayloadFromConfig(defaultCfg))
-}
-
-func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	var payload configPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
-		return
-	}
-	previous := s.buildConfigPayload()
-
-	overrides := map[string]map[string]any{
-		"app": {
-			"name":               payload.App.Name,
-			"version":            payload.App.Version,
-			"api_key":            payload.App.APIKey,
-			"auth_key":           payload.App.AuthKey,
-			"image_format":       payload.App.ImageFormat,
-			"max_upload_size_mb": payload.App.MaxUploadSizeMB,
-		},
-		"server": {
-			"host":                         payload.Server.Host,
-			"port":                         payload.Server.Port,
-			"static_dir":                   payload.Server.StaticDir,
-			"max_image_concurrency":        payload.Server.MaxImageConcurrency,
-			"image_queue_limit":            payload.Server.ImageQueueLimit,
-			"image_queue_timeout_seconds":  payload.Server.ImageQueueTimeoutSeconds,
-			"image_task_queue_ttl_seconds": payload.Server.ImageTaskQueueTTLSeconds,
-		},
-		"chatgpt": {
-			"model":                                payload.ChatGPT.Model,
-			"sse_timeout":                          payload.ChatGPT.SSETimeout,
-			"poll_interval":                        payload.ChatGPT.PollInterval,
-			"poll_max_wait":                        payload.ChatGPT.PollMaxWait,
-			"request_timeout":                      payload.ChatGPT.RequestTimeout,
-			"image_mode":                           payload.ChatGPT.ImageMode,
-			"free_image_route":                     payload.ChatGPT.FreeImageRoute,
-			"free_image_model":                     payload.ChatGPT.FreeImageModel,
-			"paid_image_route":                     payload.ChatGPT.PaidImageRoute,
-			"paid_image_model":                     payload.ChatGPT.PaidImageModel,
-			"studio_allow_disabled_image_accounts": payload.ChatGPT.StudioAllowDisabledImageAccounts,
-		},
-		"accounts": {
-			"default_quota":                   payload.Accounts.DefaultQuota,
-			"prefer_remote_refresh":           payload.Accounts.PreferRemoteRefresh,
-			"refresh_workers":                 payload.Accounts.RefreshWorkers,
-			"image_quota_refresh_ttl_seconds": payload.Accounts.ImageQuotaRefreshTTLSeconds,
-		},
-		"storage": {
-			"backend":                    payload.Storage.Backend,
-			"config_backend":             payload.Storage.ConfigBackend,
-			"auth_dir":                   payload.Storage.AuthDir,
-			"state_file":                 payload.Storage.StateFile,
-			"sync_state_dir":             payload.Storage.SyncStateDir,
-			"image_dir":                  payload.Storage.ImageDir,
-			"image_storage":              payload.Storage.ImageStorage,
-			"image_conversation_storage": payload.Storage.ImageConversationStorage,
-			"image_data_storage":         payload.Storage.ImageDataStorage,
-			"sqlite_path":                payload.Storage.SQLitePath,
-			"redis_addr":                 payload.Storage.RedisAddr,
-			"redis_password":             payload.Storage.RedisPassword,
-			"redis_db":                   payload.Storage.RedisDB,
-			"redis_prefix":               payload.Storage.RedisPrefix,
-		},
-		"sync": {
-			"enabled":         payload.Sync.Enabled,
-			"base_url":        payload.Sync.BaseURL,
-			"management_key":  payload.Sync.ManagementKey,
-			"request_timeout": payload.Sync.RequestTimeout,
-			"concurrency":     payload.Sync.Concurrency,
-			"provider_type":   payload.Sync.ProviderType,
-		},
-		"proxy": {
-			"enabled":      payload.Proxy.Enabled,
-			"url":          payload.Proxy.URL,
-			"mode":         payload.Proxy.Mode,
-			"sync_enabled": payload.Proxy.SyncEnabled,
-		},
-		"cpa": {
-			"base_url":        payload.CPA.BaseURL,
-			"api_key":         payload.CPA.APIKey,
-			"request_timeout": payload.CPA.RequestTimeout,
-			"route_strategy":  payload.CPA.RouteStrategy,
-		},
-		"newapi": {
-			"base_url":        payload.NewAPI.BaseURL,
-			"username":        payload.NewAPI.Username,
-			"password":        payload.NewAPI.Password,
-			"access_token":    payload.NewAPI.AccessToken,
-			"user_id":         payload.NewAPI.UserID,
-			"session_cookie":  payload.NewAPI.SessionCookie,
-			"request_timeout": payload.NewAPI.RequestTimeout,
-		},
-		"sub2api": {
-			"base_url":        payload.Sub2API.BaseURL,
-			"email":           payload.Sub2API.Email,
-			"password":        payload.Sub2API.Password,
-			"api_key":         payload.Sub2API.APIKey,
-			"group_id":        payload.Sub2API.GroupID,
-			"request_timeout": payload.Sub2API.RequestTimeout,
-		},
-		"log": {
-			"log_all_requests": payload.Log.LogAllRequests,
-		},
-	}
-	target := configSaveTarget{
-		ConfigBackend: payload.Storage.ConfigBackend,
-		RedisAddr:     payload.Storage.RedisAddr,
-		RedisPassword: payload.Storage.RedisPassword,
-		RedisDB:       payload.Storage.RedisDB,
-		RedisPrefix:   payload.Storage.RedisPrefix,
-	}
-	if err := s.saveConfigOverrides(r.Context(), overrides, target); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := s.reloadRuntimeDependencies(previous); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "saved",
-		"config": s.buildConfigPayload(),
-	})
-}
-
 func (s *Server) handleListRequestLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": s.reqLogs.list(100),
@@ -346,51 +196,4 @@ func (s *Server) buildConfigPayloadFromConfig(cfg *config.Config) configPayload 
 	payload.Log.LogAllRequests = cfg.Log.LogAllRequests
 	payload.Paths = s.cfg.Paths()
 	return payload
-}
-
-func (s *Server) saveConfigOverrides(ctx context.Context, values map[string]map[string]any, target configSaveTarget) error {
-	effective := resolveConfigSaveTarget(s.cfg, target)
-	if strings.EqualFold(strings.TrimSpace(effective.ConfigBackend), "redis") {
-		if strings.TrimSpace(effective.RedisAddr) == "" {
-			return fmt.Errorf("redis_addr is required when storage.config_backend = redis")
-		}
-		store := configstore.NewRedis(
-			effective.RedisAddr,
-			effective.RedisPassword,
-			effective.RedisDB,
-			effective.RedisPrefix,
-		)
-		defer store.Close()
-		if err := store.Save(ctx, values); err != nil {
-			return err
-		}
-		bootstrapOverrides := map[string]map[string]any{
-			"storage": {
-				"config_backend": effective.ConfigBackend,
-				"redis_addr":     effective.RedisAddr,
-				"redis_password": effective.RedisPassword,
-				"redis_db":       effective.RedisDB,
-				"redis_prefix":   effective.RedisPrefix,
-			},
-		}
-		if err := s.cfg.PersistOverrideFile(bootstrapOverrides); err != nil {
-			return err
-		}
-		return s.cfg.ApplyOverrides(values)
-	}
-	return s.cfg.SaveOverrides(values)
-}
-
-func resolveConfigSaveTarget(current *config.Config, target configSaveTarget) configSaveTarget {
-	result := configSaveTarget{
-		ConfigBackend: target.ConfigBackend,
-		RedisAddr:     target.RedisAddr,
-		RedisPassword: target.RedisPassword,
-		RedisDB:       target.RedisDB,
-		RedisPrefix:   target.RedisPrefix,
-	}
-	if strings.TrimSpace(result.ConfigBackend) == "" {
-		result.ConfigBackend = current.Storage.ConfigBackend
-	}
-	return result
 }
