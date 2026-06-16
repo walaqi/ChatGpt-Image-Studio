@@ -37,11 +37,6 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 	if lease == nil {
 		return nil, fmt.Errorf("task lease is required")
 	}
-	// A studio (account-pool) lease must carry an auth file; a multi-tenant CPA
-	// lease has none — credentials are resolved per-user from the context.
-	if !lease.cpa && lease.auth == nil {
-		return nil, fmt.Errorf("task lease is required")
-	}
 	task := s.imageTasks.copyTask(taskID)
 	if task == nil {
 		return nil, fmt.Errorf("task not found")
@@ -51,13 +46,12 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 	metadata := newImageRequestMetadata(task.Prompt, task.Size, task.Quality)
 	requestedModel := normalizeRequestedImageModel(task.Model, s.cfg.ChatGPT.Model)
 
-	// Build the operation once; the only thing that differs between studio and
-	// multi-tenant CPA mode is which runner executes the closure.
+	// Build the operation once; the runner closure executes against the
+	// per-user CPA credential.
 	var (
-		operation         string
-		preferredAccount  bool
-		responsesEligible bool
-		run               func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error)
+		operation        string
+		preferredAccount bool
+		run              func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error)
 	)
 
 	switch {
@@ -91,51 +85,22 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 			return nil, err
 		}
 		operation = "edit"
-		responsesEligible = handler.SupportsResponsesInlineEdit(imageFiles, mask)
 		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
 			return client.EditImageByUpload(ctx, task.Prompt, upstreamModel, imageFiles, mask, task.Size, task.Quality)
 		}
 	default:
 		operation = "generate"
-		responsesEligible = true
 		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
 			return client.GenerateImage(ctx, task.Prompt, upstreamModel, 1, task.Size, task.Quality, task.Background)
 		}
 	}
 
-	// Multi-tenant CPA path: resolve the per-user credential from the userID
-	// the scheduler injected into ctx (§8 item 3 — never a shared/account-pool
-	// fallback). Admission is skipped because the task manager already bounds
-	// concurrency via runningUnits, matching the studio task path's contract.
-	if lease.cpa {
-		items, err := s.runPureCPAImageRequest(ctx, operation, task.ResponseFormat, requestedModel, preferredAccount, metadata, run, fakeReq, false)
-		if err != nil {
-			return nil, err
-		}
-		return historyImagesFromResponseItems(items), nil
-	}
-
-	items, retryable, err := s.runImageRequestWithAdmission(
-		ctx,
-		lease.auth,
-		lease.account,
-		lease.release,
-		lease.decision,
-		operation,
-		task.ResponseFormat,
-		preferredAccount,
-		requestedModel,
-		responsesEligible,
-		metadata,
-		run,
-		fakeReq,
-		false,
-	)
-	lease.release = nil
+	// Resolve the per-user credential from the userID the scheduler injected
+	// into ctx (§8 item 3 — never a shared/account-pool fallback). Admission is
+	// skipped because the task manager already bounds concurrency via
+	// runningUnits.
+	items, err := s.runPureCPAImageRequest(ctx, operation, task.ResponseFormat, requestedModel, preferredAccount, metadata, run, fakeReq, false)
 	if err != nil {
-		if retryable {
-			return nil, &imageTaskDeferredError{cause: err}
-		}
 		return nil, err
 	}
 	return historyImagesFromResponseItems(items), nil

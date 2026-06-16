@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"chatgpt2api/internal/accounts"
 	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/imagehistory"
 )
@@ -24,15 +23,13 @@ var (
 	imageTaskRetryBackoffMax  = 20 * time.Second
 )
 
+// imageTaskLease marks a scheduled task unit. In the multi-tenant CPA model
+// there is no account-pool lease to hold; execution resolves a per-user
+// credential from the task's userID (see executeImageTaskUnit). Concurrency is
+// bounded by the task manager's runningUnits cap. The struct is retained as a
+// scheduler handle so the run/release plumbing stays uniform.
 type imageTaskLease struct {
-	auth     *accounts.LocalAuth
-	account  accounts.PublicAccount
-	decision accounts.ImageAccountRoutingDecision
-	release  func()
-	// cpa marks a multi-tenant lease: execution resolves a per-user CPA
-	// credential from the task's userID instead of holding an account-pool
-	// lease. auth/account/release are unused for cpa leases.
-	cpa bool
+	release func()
 }
 
 // imageTaskSubscriber is one SSE listener, scoped to the user that opened the
@@ -69,17 +66,6 @@ func (m *imageTaskManager) createTask(userID string, req createImageTaskRequest)
 	task, err := m.newTask(req)
 	if err != nil {
 		return nil, err
-	}
-	if ok, err := m.hasPotentialCompatibleAccounts(task); err != nil {
-		return nil, err
-	} else if !ok {
-		if task.Requirement.NeedPaid {
-			return nil, newRequestError("paid_resolution_requires_paid_account", "当前分辨率仅支持 Plus / Pro / Team 图片账号，请先确保有可用 Paid 账号")
-		}
-		if task.Requirement.SourceAccountID != "" {
-			return nil, newRequestError("source_account_unavailable", "原始图片所属账号当前不可用，请使用普通编辑重试")
-		}
-		return nil, newRequestError("no_available_image_accounts", "当前没有可用的图片账号")
 	}
 
 	m.mu.Lock()
@@ -701,124 +687,10 @@ func (m *imageTaskManager) removeTaskIDFromOrderLocked(taskID string) {
 func (m *imageTaskManager) acquireLeaseForTask(task *imageTask) (*imageTaskLease, imageTaskBlocker, error) {
 	// Multi-tenant CPA mode: execution resolves a per-user credential from the
 	// task's userID (see executeImageTaskUnit), so there is no account-pool
-	// lease to acquire. Return a marker lease; concurrency is still bounded by
-	// the task manager's runningUnits cap.
-	if m.server.configuredImageMode() == "cpa" {
-		return &imageTaskLease{cpa: true}, imageTaskBlocker{}, nil
-	}
-
-	store := m.server.getStore()
-	allowDisabled := m.server.allowDisabledStudioImageAccounts()
-
-	if task.Requirement.SourceAccountID != "" {
-		auth, account, release, err := store.FindImageAuthByIDWithLease(task.Requirement.SourceAccountID)
-		if err == nil {
-			return &imageTaskLease{
-				auth:    auth,
-				account: account,
-				release: release,
-			}, imageTaskBlocker{}, nil
-		}
-		if errors.Is(err, accounts.ErrSourceAccountNotFound) {
-			return nil, imageTaskBlocker{}, newRequestError("source_account_not_found", "原始图片所属账号不存在，请使用普通编辑重试")
-		}
-		if errors.Is(err, accounts.ErrImageAuthInUse) {
-			return nil, imageTaskBlocker{Code: string(imageTaskWaitingReasonSourceAccountBusy), Detail: "等待原始图片所属账号空闲"}, nil
-		}
-		return nil, imageTaskBlocker{}, err
-	}
-
-	allowAccount := m.allowAccountFn(task)
-	if task.Requirement.PolicySnapshot != nil && task.Requirement.PolicySnapshot.Enabled {
-		auth, account, decision, release, err := store.AcquireImageAuthLeaseWithPolicyFilteredWithDisabledOption(
-			nil,
-			allowAccount,
-			allowDisabled,
-			task.Requirement.PolicySnapshot,
-		)
-		if err == nil {
-			return &imageTaskLease{
-				auth:     auth,
-				account:  account,
-				decision: decision,
-				release:  release,
-			}, imageTaskBlocker{}, nil
-		}
-		if errors.Is(err, accounts.ErrSelectedImageGroupsExhausted) || errors.Is(err, accounts.ErrNoAvailableImageAuth) || errors.Is(err, accounts.ErrImageAuthInUse) {
-			return nil, m.busyBlocker(task), nil
-		}
-		return nil, imageTaskBlocker{}, err
-	}
-
-	auth, account, release, err := store.AcquireImageAuthLeaseFilteredWithDisabledOption(
-		nil,
-		allowAccount,
-		allowDisabled,
-	)
-	if err == nil {
-		return &imageTaskLease{
-			auth:    auth,
-			account: account,
-			release: release,
-		}, imageTaskBlocker{}, nil
-	}
-	if errors.Is(err, accounts.ErrNoAvailableImageAuth) || errors.Is(err, accounts.ErrImageAuthInUse) {
-		return nil, m.busyBlocker(task), nil
-	}
-	return nil, imageTaskBlocker{}, err
-}
-
-func (m *imageTaskManager) hasPotentialCompatibleAccounts(task *imageTask) (bool, error) {
-	// Multi-tenant CPA mode has no account pool. Credential availability is
-	// resolved per-user at execution time (resolveImageCredential); a missing
-	// or unusable key surfaces as a task failure with a stable error code, not
-	// a creation-time rejection. So task creation is always permitted here.
-	if m.server.configuredImageMode() == "cpa" {
-		return true, nil
-	}
-
-	store := m.server.getStore()
-	allowDisabled := m.server.allowDisabledStudioImageAccounts()
-
-	if task.Requirement.SourceAccountID != "" {
-		auth, account, err := store.FindImageAuthByID(task.Requirement.SourceAccountID)
-		if err != nil || auth == nil {
-			return false, nil
-		}
-		if !isImageAccountUsable(account, allowDisabled) && !accounts.NeedsImageQuotaRefreshWithTTL(account, time.Now(), m.server.cfg.ImageQuotaRefreshTTL()) {
-			return false, nil
-		}
-		return true, nil
-	}
-
-	count, err := store.CountPotentialImageAuthCandidatesWithPolicyFilteredWithDisabledOption(
-		m.allowAccountFn(task),
-		allowDisabled,
-		task.Requirement.PolicySnapshot,
-	)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
-func (m *imageTaskManager) allowAccountFn(task *imageTask) func(accounts.PublicAccount) bool {
-	if !task.Requirement.NeedPaid {
-		return nil
-	}
-	return func(account accounts.PublicAccount) bool {
-		return isPaidImageAccountType(account.Type)
-	}
-}
-
-func (m *imageTaskManager) busyBlocker(task *imageTask) imageTaskBlocker {
-	if task.Requirement.SourceAccountID != "" {
-		return imageTaskBlocker{Code: string(imageTaskWaitingReasonSourceAccountBusy), Detail: "等待原始图片所属账号空闲"}
-	}
-	if task.Requirement.NeedPaid {
-		return imageTaskBlocker{Code: string(imageTaskWaitingReasonPaidAccountBusy), Detail: "等待 Paid 图片账号空闲"}
-	}
-	return imageTaskBlocker{Code: string(imageTaskWaitingReasonCompatibleAccountBusy), Detail: "等待兼容图片账号空闲"}
+	// lease to acquire. Return a marker lease; concurrency is bounded by the
+	// task manager's runningUnits cap.
+	_ = task
+	return &imageTaskLease{}, imageTaskBlocker{}, nil
 }
 
 func (m *imageTaskManager) newTask(req createImageTaskRequest) (*imageTask, error) {
@@ -860,19 +732,9 @@ func (m *imageTaskManager) newTask(req createImageTaskRequest) (*imageTask, erro
 		}
 	}
 
-	resolutionAccess := strings.ToLower(strings.TrimSpace(req.ResolutionAccess))
-	requirePaid := m.server.configuredImageMode() == "studio" &&
-		(resolutionAccess == "paid" || requiresPaidGenerateTask(req.Size))
-	requirement := imageTaskRequirement{
-		NeedPaid:        requirePaid,
-		SourceAccountID: "",
-	}
+	requirement := imageTaskRequirement{}
 	if sourceReference != nil && sourceReference.SourceAccountID != "" {
 		requirement.SourceAccountID = sourceReference.SourceAccountID
-		requirement.NeedPaid = false
-	} else if req.Policy != nil && req.Policy.Enabled {
-		normalized := req.Policy.Normalize()
-		requirement.PolicySnapshot = &normalized
 	}
 
 	createdAt := time.Now().UTC()

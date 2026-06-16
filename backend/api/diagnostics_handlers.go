@@ -138,20 +138,6 @@ func (s *Server) collectRuntimeStatus(ctx context.Context) runtimeStatusResponse
 		}
 	}
 
-	accountsList, err := s.getStore().ListAccounts()
-	if err == nil {
-		allowDisabled := s.allowDisabledStudioImageAccounts()
-		out.Accounts.Total = len(accountsList)
-		for _, account := range accountsList {
-			if isImageAccountUsable(account, allowDisabled) {
-				out.Accounts.Available++
-				if account.Type == "Plus" || account.Type == "Pro" || account.Type == "Team" {
-					out.Accounts.AvailablePaid++
-				}
-			}
-		}
-	}
-
 	out.Recent.WindowSeconds = 600
 	windowStart := now.Add(-10 * time.Minute)
 	for _, item := range s.reqLogs.list(200) {
@@ -217,58 +203,24 @@ func (s *Server) runStartupCheck(ctx context.Context) startupCheckResponse {
 		return checkStatusPass, fmt.Sprintf("代理可连接：%s", target), ""
 	})
 
-	addCheck("chatgpt", "官方站点连通", func() (string, string, string) {
-		if result.Mode != "studio" {
-			return checkStatusWarn, "当前不是 studio 模式，已跳过官方链路检测", ""
-		}
-		statusCode, err := probeEndpoint(ctx, "https://chatgpt.com", s.cfg.ChatGPTProxyURL(), 8*time.Second)
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("访问 chatgpt.com 失败：%v", err), "请检查代理、网络或防火墙设置"
-		}
-		return checkStatusPass, fmt.Sprintf("chatgpt.com 可达，HTTP %d", statusCode), ""
-	})
-
 	addCheck("cpa", "CPA 服务连通", func() (string, string, string) {
 		baseURL := strings.TrimSpace(s.cfg.CPAImageBaseURL())
 		if baseURL == "" {
-			if result.Mode == "cpa" {
-				return checkStatusFail, "CPA base URL 未配置", "请在配置中填写 cpa.base_url 或 sync.base_url"
-			}
-			return checkStatusWarn, "CPA base URL 未配置", ""
+			return checkStatusFail, "CPA base URL 未配置", "请在配置中填写 cpa.base_url"
 		}
 		normalized := normalizeProbeURL(baseURL)
 		statusCode, err := probeEndpoint(ctx, normalized, "", 5*time.Second)
 		if err != nil {
-			if result.Mode == "cpa" {
-				return checkStatusFail, fmt.Sprintf("CPA 服务不可达：%v", err), ""
-			}
-			return checkStatusWarn, fmt.Sprintf("CPA 服务不可达：%v", err), ""
+			return checkStatusFail, fmt.Sprintf("CPA 服务不可达：%v", err), ""
 		}
 		return checkStatusPass, fmt.Sprintf("CPA 服务可达，HTTP %d", statusCode), ""
 	})
 
-	addCheck("accounts", "账号可用性", func() (string, string, string) {
-		accountsList, err := s.getStore().ListAccounts()
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("读取账号失败：%v", err), ""
+	addCheck("credential", "凭证服务", func() (string, string, string) {
+		if s.credService == nil {
+			return checkStatusWarn, "未配置母系统凭证回调（credential.endpoint_base）", "单租户/开发模式将回退到全局 [cpa] 配置"
 		}
-		allowDisabled := s.allowDisabledStudioImageAccounts()
-		available := 0
-		for _, account := range accountsList {
-			if isImageAccountUsable(account, allowDisabled) {
-				available++
-			}
-		}
-		if len(accountsList) == 0 {
-			return checkStatusFail, "当前账号池为空", "请先导入或创建账号"
-		}
-		if result.Mode == "studio" && available == 0 {
-			return checkStatusFail, fmt.Sprintf("账号总数 %d，可用账号 0", len(accountsList)), "请刷新账号状态或修复代理后重试"
-		}
-		if available == 0 {
-			return checkStatusWarn, fmt.Sprintf("账号总数 %d，可用账号 0", len(accountsList)), ""
-		}
-		return checkStatusPass, fmt.Sprintf("账号总数 %d，可用账号 %d", len(accountsList), available), ""
+		return checkStatusPass, "已配置母系统凭证回调", ""
 	})
 
 	for _, item := range result.Checks {

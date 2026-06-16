@@ -53,7 +53,7 @@ func newSessionTestServer(t *testing.T) (*Server, *rsa.PrivateKey) {
 	cfg.Identity.SessionSecret = "test-session-secret"
 	cfg.Identity.SessionTTLSeconds = 3600
 
-	server := NewServer(cfg, nil, nil)
+	server := NewServer(cfg)
 	if server.entryVerifier == nil {
 		t.Fatal("entryVerifier is nil; expected it to be configured from the public key")
 	}
@@ -205,7 +205,7 @@ func TestSessionUnavailableWithoutVerifier(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	// No JWTPublicKeyPath configured → entry verifier nil.
-	server := NewServer(cfg, nil, nil)
+	server := NewServer(cfg)
 	if server.entryVerifier != nil {
 		t.Fatal("expected nil entryVerifier without configured key")
 	}

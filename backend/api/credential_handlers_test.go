@@ -76,7 +76,7 @@ func newCredentialTestServer(t *testing.T, resolver credential.Resolver) (*Serve
 	cfg.Identity.SessionSecret = "test-secret"
 	cfg.Identity.SessionTTLSeconds = 3600
 
-	server := NewServer(cfg, nil, nil)
+	server := NewServer(cfg)
 	server.credService = credential.NewService(resolver, credential.NewMemorySelectionStore())
 
 	mint := func(userID string) *http.Cookie {
@@ -212,7 +212,7 @@ func TestResolveImageCredentialFallbackToConfig(t *testing.T) {
 	}
 	cfg.CPA.BaseURL = "http://cpa/v1"
 	cfg.CPA.APIKey = "sk-global"
-	server := NewServer(cfg, nil, nil)
+	server := NewServer(cfg)
 	server.credService = nil // force fallback
 
 	cred, err := server.resolveImageCredential(context.Background())

@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"chatgpt2api/internal/accounts"
 	"chatgpt2api/internal/imagehistory"
 )
 
@@ -64,10 +63,9 @@ type createImageTaskRequest struct {
 	Quality          string                              `json:"quality,omitempty"`
 	Background       string                              `json:"background,omitempty"`
 	ResponseFormat   string                              `json:"responseFormat,omitempty"`
-	RetryImageIndex  *int                                `json:"retryImageIndex,omitempty"`
-	SourceImages     []imageTaskSourceImagePayload       `json:"sourceImages,omitempty"`
-	SourceReference  *imageTaskSourceReferencePayload    `json:"sourceReference,omitempty"`
-	Policy           *accounts.ImageAccountRoutingPolicy `json:"policy,omitempty"`
+	RetryImageIndex  *int                             `json:"retryImageIndex,omitempty"`
+	SourceImages     []imageTaskSourceImagePayload    `json:"sourceImages,omitempty"`
+	SourceReference  *imageTaskSourceReferencePayload `json:"sourceReference,omitempty"`
 }
 
 type imageTaskBlocker struct {
@@ -131,10 +129,12 @@ type imageTaskEvent struct {
 	userID string `json:"-"`
 }
 
+// imageTaskRequirement carries execution constraints derived at task creation.
+// In the cpa-only multi-tenant model the only constraint is the optional
+// selection-edit source binding (SourceAccountID); studio account-pool routing
+// (paid-account requirement, group policy) was removed in phase 7.
 type imageTaskRequirement struct {
-	NeedPaid        bool
 	SourceAccountID string
-	PolicySnapshot  *accounts.ImageAccountRoutingPolicy
 }
 
 type imageTaskSourceImage struct {

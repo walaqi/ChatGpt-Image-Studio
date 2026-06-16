@@ -28,7 +28,7 @@ func newTenantTestServer(t *testing.T) (*Server, func(userID string) *http.Cooki
 	cfg.Identity.SessionSecret = "tenant-test-secret"
 	cfg.Identity.SessionTTLSeconds = 3600
 
-	server := NewServer(cfg, nil, nil)
+	server := NewServer(cfg)
 	mint := func(userID string) *http.Cookie {
 		token, err := server.sessionManager.Mint(userID)
 		if err != nil {

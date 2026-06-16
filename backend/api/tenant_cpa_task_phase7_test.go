@@ -15,15 +15,7 @@ import (
 // and never an account-pool lease. It proves the async task path reaches the
 // same per-user resolution the sync /v1 path already had.
 func TestPhase7CPATaskUsesPerUserCredential(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:        "cpa",
-		accountType:      "Free",
-		freeRoute:        "legacy",
-		freeModel:        "auto",
-		paidRoute:        "responses",
-		paidModel:        "gpt-5.4-mini",
-		cpaRouteStrategy: "images_api",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	const userA = "tenant-A"
 
@@ -59,11 +51,9 @@ func TestPhase7CPATaskUsesPerUserCredential(t *testing.T) {
 		gotAPIKey = apiKey
 		gotCalls++
 		mu.Unlock()
-		return &compatStubWorkflowClient{
-			factory:  "cpa",
-			token:    "cpa",
-			cpaRoute: routeStrategy,
-			model:    imageModel,
+		return &cpaStubWorkflowClient{
+			route: routeStrategy,
+			model: imageModel,
 		}
 	}
 
