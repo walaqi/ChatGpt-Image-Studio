@@ -91,3 +91,20 @@ export function requestReauth(): void {
     window.parent.postMessage({ type: "image-studio:reauth" }, "*");
   }
 }
+
+// requestCreateCredential asks the parent (mother system) window to take the
+// user to its key-creation flow under the preset image group. Used by the
+// credential picker when the user has no usable image key yet
+// (docs/multi-tenant-redesign.md §4.6). The mother system owns the actual
+// create-key UI; image-studio only signals intent and the target group.
+export function requestCreateCredential(imageGroupId: number | null): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage(
+      { type: "image-studio:create-credential", imageGroupId },
+      "*",
+    );
+  }
+}
