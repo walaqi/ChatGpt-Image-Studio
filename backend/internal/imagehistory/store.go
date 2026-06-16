@@ -620,8 +620,12 @@ func (b *sqliteBackend) Init() error {
 	return b.migrateUserIDColumn()
 }
 
-// migrateUserIDColumn adds the user_id column + index to pre-existing databases.
-// Legacy rows get an empty user_id (treated as the single-tenant tenant).
+// migrateUserIDColumn adds the user_id column + index to pre-existing databases
+// (§5). Phase 7 made image-studio cpa-only multi-tenant with no single-tenant
+// fallback, so legacy rows (written before the column existed) carry an empty
+// user_id that cannot be attributed to any tenant; they are purged on migration
+// rather than leaked to an arbitrary owner. After migration every row is
+// written with a real session-derived user_id, so no new empty rows appear.
 func (b *sqliteBackend) migrateUserIDColumn() error {
 	hasColumn, err := b.columnExists("image_conversations", "user_id")
 	if err != nil {
@@ -629,6 +633,10 @@ func (b *sqliteBackend) migrateUserIDColumn() error {
 	}
 	if !hasColumn {
 		if _, err := b.db.Exec(`ALTER TABLE image_conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+		// Drop unattributable legacy rows surfaced by the migration.
+		if _, err := b.db.Exec(`DELETE FROM image_conversations WHERE user_id = ''`); err != nil {
 			return err
 		}
 	}

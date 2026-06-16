@@ -2,6 +2,7 @@ package imagehistory
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -360,4 +361,52 @@ func TestSQLiteStorePersistsImageHistoryAcrossReload(t *testing.T) {
 
 func TestRedisStorePersistsImageHistoryAcrossReload(t *testing.T) {
 	testStorePersistenceAcrossReload(t, "redis")
+}
+
+// TestSQLiteMigrationPurgesLegacyRows proves the §5 DB migration: when an old
+// single-tenant database (no user_id column) is opened, the migration adds the
+// column + index and DELETEs the legacy ownerless rows rather than silently
+// assigning them an empty user_id (per the multi-tenant cutover decision).
+func TestSQLiteMigrationPurgesLegacyRows(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "legacy-history.sqlite")
+
+	// Build a pre-migration database: original schema, one ownerless row.
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE image_conversations (id TEXT PRIMARY KEY, raw_json BLOB NOT NULL, updated_at TEXT NOT NULL);`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO image_conversations(id, raw_json, updated_at) VALUES(?, ?, ?)`,
+		"legacy-conv", []byte(`{"id":"legacy-conv"}`), "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	// Opening through the backend runs the migration.
+	backend := &sqliteBackend{path: dbPath}
+	if err := backend.Init(); err != nil {
+		t.Fatalf("Init (migration): %v", err)
+	}
+	defer backend.db.Close()
+
+	hasColumn, err := backend.columnExists("image_conversations", "user_id")
+	if err != nil {
+		t.Fatalf("columnExists: %v", err)
+	}
+	if !hasColumn {
+		t.Fatal("user_id column should exist after migration")
+	}
+
+	var count int
+	if err := backend.db.QueryRow(`SELECT COUNT(*) FROM image_conversations`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("legacy ownerless rows = %d, want 0 (purged by migration)", count)
+	}
 }
