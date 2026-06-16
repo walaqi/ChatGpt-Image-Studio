@@ -1,10 +1,5 @@
 import { httpRequest } from "@/lib/request";
 import webConfig from "@/constants/common-env";
-import {
-  buildImageAccountPolicyHeader,
-  normalizeImageAccountPolicy,
-  type StoredImageAccountPolicy,
-} from "@/store/image-account-policy";
 
 export type AccountType = "Free" | "Plus" | "Pro" | "Team";
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -462,57 +457,13 @@ export type RuntimeStatusResponse = {
   };
 };
 
-type ImageAccountPolicyResponse = {
-  policy: StoredImageAccountPolicy;
-};
-
-let cachedImageAccountPolicy: StoredImageAccountPolicy | null = null;
 let cachedConfig: ConfigPayload | null = null;
-
-export function setCachedImageAccountPolicy(
-  policy: StoredImageAccountPolicy | null,
-) {
-  cachedImageAccountPolicy = policy ? normalizeImageAccountPolicy(policy) : null;
-}
 
 function setCachedConfig(config: ConfigPayload | null) {
   cachedConfig = config;
 }
 
-export async function fetchImageAccountPolicy() {
-  const data = await httpRequest<ImageAccountPolicyResponse>(
-    "/api/accounts/image-policy",
-  );
-  const normalized = normalizeImageAccountPolicy(data.policy);
-  setCachedImageAccountPolicy(normalized);
-  return normalized;
-}
 
-export async function updateImageAccountPolicy(
-  policy: StoredImageAccountPolicy,
-) {
-  const data = await httpRequest<ImageAccountPolicyResponse>(
-    "/api/accounts/image-policy",
-    {
-      method: "PUT",
-      body: { policy: normalizeImageAccountPolicy(policy) },
-    },
-  );
-  const normalized = normalizeImageAccountPolicy(data.policy);
-  setCachedImageAccountPolicy(normalized);
-  return normalized;
-}
-
-async function getImageAccountPolicyForRequest() {
-  if (cachedImageAccountPolicy) {
-    return cachedImageAccountPolicy;
-  }
-  try {
-    return await fetchImageAccountPolicy();
-  } catch {
-    return normalizeImageAccountPolicy(null);
-  }
-}
 
 function resolveImageResponseFormat(config: ConfigPayload | null) {
   return config?.storage.imageDataStorage === "server" ? "url" : "b64_json";
@@ -847,17 +798,10 @@ export async function generateImageWithOptions(
   } = {},
 ) {
   const { model = "gpt-image-2", count = 1, size, quality = "high" } = options;
-  const [policy, responseFormat] = await Promise.all([
-    getImageAccountPolicyForRequest(),
-    getImageResponseFormatForRequest(),
-  ]);
-  const policyHeader = buildImageAccountPolicyHeader(policy);
+  const responseFormat = await getImageResponseFormatForRequest();
   const normalizedCount = Math.max(1, count);
   return httpRequest<ImageResponse>("/v1/images/generations", {
     method: "POST",
-    headers: policyHeader
-      ? { "X-Studio-Account-Policy": policyHeader }
-      : undefined,
     body: {
       prompt,
       model,
@@ -889,9 +833,7 @@ export async function createImageTask(payload: {
     url?: string;
   }>;
   sourceReference?: InpaintSourceReference;
-  policy?: StoredImageAccountPolicy;
 }) {
-  const policy = payload.policy ?? (await getImageAccountPolicyForRequest());
   return httpRequest<ImageTaskResponse>("/api/image/tasks", {
     method: "POST",
     body: {
@@ -911,7 +853,6 @@ export async function createImageTask(payload: {
       quality: payload.quality,
       sourceImages: payload.sourceImages ?? [],
       sourceReference: payload.sourceReference,
-      policy: normalizeImageAccountPolicy(policy),
     },
   });
 }
@@ -1017,11 +958,7 @@ export async function editImage({
   model?: ImageModel;
 }) {
   const formData = new FormData();
-  const [policy, responseFormat] = await Promise.all([
-    getImageAccountPolicyForRequest(),
-    getImageResponseFormatForRequest(),
-  ]);
-  const policyHeader = buildImageAccountPolicyHeader(policy);
+  const responseFormat = await getImageResponseFormatForRequest();
   formData.append("prompt", prompt);
   formData.append("model", model);
   formData.append("response_format", responseFormat);
@@ -1048,9 +985,6 @@ export async function editImage({
   }
   return httpRequest<ImageResponse>("/v1/images/edits", {
     method: "POST",
-    headers: policyHeader
-      ? { "X-Studio-Account-Policy": policyHeader }
-      : undefined,
     body: formData,
   });
 }
