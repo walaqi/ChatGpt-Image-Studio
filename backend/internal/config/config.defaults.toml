@@ -16,6 +16,9 @@ static_dir = "static"
 # 用于在兼容 /v1/images/* 响应里生成浏览器可见的图片 URL。
 # 留空表示本地直连开发，不加前缀。
 public_base_path = ""
+# 允许携带凭证（cookie）的跨域来源白名单。生产为同源反代，跨域不触发，可留空。
+# 仅开发期需要：Vite dev server（localhost:5173）与后端（localhost:7000）不同源。
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 max_image_concurrency = 8
 image_queue_limit = 32
 image_queue_timeout_seconds = 20

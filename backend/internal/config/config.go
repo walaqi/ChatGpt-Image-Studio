@@ -40,14 +40,15 @@ type AppConfig struct {
 }
 
 type ServerConfig struct {
-	Host                     string `toml:"host"`
-	Port                     int    `toml:"port"`
-	StaticDir                string `toml:"static_dir"`
-	PublicBasePath           string `toml:"public_base_path"`
-	MaxImageConcurrency      int    `toml:"max_image_concurrency"`
-	ImageQueueLimit          int    `toml:"image_queue_limit"`
-	ImageQueueTimeoutSeconds int    `toml:"image_queue_timeout_seconds"`
-	ImageTaskQueueTTLSeconds int    `toml:"image_task_queue_ttl_seconds"`
+	Host                     string   `toml:"host"`
+	Port                     int      `toml:"port"`
+	StaticDir                string   `toml:"static_dir"`
+	PublicBasePath           string   `toml:"public_base_path"`
+	AllowedOrigins           []string `toml:"allowed_origins"`
+	MaxImageConcurrency      int      `toml:"max_image_concurrency"`
+	ImageQueueLimit          int      `toml:"image_queue_limit"`
+	ImageQueueTimeoutSeconds int      `toml:"image_queue_timeout_seconds"`
+	ImageTaskQueueTTLSeconds int      `toml:"image_task_queue_ttl_seconds"`
 }
 
 type ChatGPTConfig struct {

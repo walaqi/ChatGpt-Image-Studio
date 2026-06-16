@@ -174,7 +174,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/", http.HandlerFunc(s.handleWebApp))
 
 	handler := middleware.RequestID(middleware.Logger(mux))
-	return middleware.CORS(handler)
+	return middleware.CORS(s.cfg.Server.AllowedOrigins)(handler)
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
