@@ -7,57 +7,6 @@ import (
 	"testing"
 )
 
-func TestValidateProxyConfig(t *testing.T) {
-	cfg := &Config{
-		Proxy: ProxyConfig{
-			Enabled: true,
-			URL:     "socks5h://127.0.0.1:10808",
-			Mode:    "fixed",
-		},
-	}
-
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("expected valid proxy config, got %v", err)
-	}
-}
-
-func TestValidateRejectsUnsupportedProxyMode(t *testing.T) {
-	cfg := &Config{
-		Proxy: ProxyConfig{
-			Enabled: true,
-			URL:     "socks5h://127.0.0.1:10808",
-			Mode:    "singbox",
-		},
-	}
-
-	if err := cfg.validate(); err == nil {
-		t.Fatal("expected unsupported mode validation error")
-	}
-}
-
-func TestProxyURLs(t *testing.T) {
-	cfg := &Config{
-		Proxy: ProxyConfig{
-			Enabled:     true,
-			URL:         "socks5h://127.0.0.1:10808",
-			Mode:        "fixed",
-			SyncEnabled: false,
-		},
-	}
-
-	if got := cfg.ChatGPTProxyURL(); got != "socks5h://127.0.0.1:10808" {
-		t.Fatalf("unexpected chatgpt proxy url %q", got)
-	}
-	if got := cfg.SyncProxyURL(); got != "" {
-		t.Fatalf("expected sync proxy to be disabled, got %q", got)
-	}
-
-	cfg.Proxy.SyncEnabled = true
-	if got := cfg.SyncProxyURL(); got != "socks5h://127.0.0.1:10808" {
-		t.Fatalf("unexpected sync proxy url %q", got)
-	}
-}
-
 func TestDetectConfigRootFindsBackendFromRepoRoot(t *testing.T) {
 	rootDir := t.TempDir()
 	backendDir := filepath.Join(rootDir, "backend")
@@ -116,24 +65,22 @@ func TestNormalizeRootPrefersExecutableConfigRoot(t *testing.T) {
 	}
 }
 
-func TestValidateTreatsLegacyMixAsStudio(t *testing.T) {
+func TestValidateTreatsLegacyMixAsCPA(t *testing.T) {
 	cfg := &Config{
 		ChatGPT: ChatGPTConfig{
-			ImageMode:      "mix",
-			FreeImageRoute: "legacy",
-			PaidImageRoute: "responses",
+			ImageMode: "mix",
 		},
 	}
 
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() returned error: %v", err)
 	}
-	if cfg.ChatGPT.ImageMode != "studio" {
-		t.Fatalf("image mode = %q, want studio", cfg.ChatGPT.ImageMode)
+	if cfg.ChatGPT.ImageMode != "cpa" {
+		t.Fatalf("image mode = %q, want cpa", cfg.ChatGPT.ImageMode)
 	}
 }
 
-func TestLoadMigratesLegacyMixOverrideToStudio(t *testing.T) {
+func TestLoadMigratesLegacyMixOverrideToCPA(t *testing.T) {
 	rootDir := t.TempDir()
 	dataDir := filepath.Join(rootDir, "data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
@@ -144,8 +91,6 @@ func TestLoadMigratesLegacyMixOverrideToStudio(t *testing.T) {
 	override := strings.Join([]string{
 		"[chatgpt]",
 		`image_mode = "mix"`,
-		`free_image_route = "legacy"`,
-		`paid_image_route = "responses"`,
 		"",
 	}, "\n")
 	if err := os.WriteFile(overridePath, []byte(override), 0o644); err != nil {
@@ -156,16 +101,16 @@ func TestLoadMigratesLegacyMixOverrideToStudio(t *testing.T) {
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("Load() returned error: %v", err)
 	}
-	if cfg.ChatGPT.ImageMode != "studio" {
-		t.Fatalf("loaded image mode = %q, want studio", cfg.ChatGPT.ImageMode)
+	if cfg.ChatGPT.ImageMode != "cpa" {
+		t.Fatalf("loaded image mode = %q, want cpa", cfg.ChatGPT.ImageMode)
 	}
 
 	content, err := os.ReadFile(overridePath)
 	if err != nil {
 		t.Fatalf("read override: %v", err)
 	}
-	if !strings.Contains(string(content), `image_mode = "studio"`) {
-		t.Fatalf("override file was not migrated to studio: %s", string(content))
+	if !strings.Contains(string(content), `image_mode = "cpa"`) {
+		t.Fatalf("override file was not migrated to cpa: %s", string(content))
 	}
 	if strings.Contains(string(content), `image_mode = "mix"`) {
 		t.Fatalf("override file still contains legacy mix value: %s", string(content))
@@ -194,53 +139,6 @@ func TestNormalizeCPAImageRouteStrategyPreservesKnownValues(t *testing.T) {
 	}
 }
 
-func TestValidateNormalizesResponsesOnlyImageModels(t *testing.T) {
-	cfg := &Config{
-		ChatGPT: ChatGPTConfig{
-			ImageMode:      "studio",
-			FreeImageRoute: "responses",
-			FreeImageModel: "gpt-image-2",
-			PaidImageRoute: "responses",
-			PaidImageModel: "gpt-image-2",
-		},
-	}
-
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate() returned error: %v", err)
-	}
-	if cfg.ChatGPT.FreeImageModel != "auto" {
-		t.Fatalf("FreeImageModel = %q, want auto", cfg.ChatGPT.FreeImageModel)
-	}
-	if cfg.ChatGPT.PaidImageModel != "gpt-5.4-mini" {
-		t.Fatalf("PaidImageModel = %q, want gpt-5.4-mini", cfg.ChatGPT.PaidImageModel)
-	}
-}
-
-func TestValidatePreservesLegacyImageModels(t *testing.T) {
-	cfg := &Config{
-		ChatGPT: ChatGPTConfig{
-			ImageMode:      "studio",
-			FreeImageRoute: "",
-			FreeImageModel: "gpt-image-2",
-			PaidImageRoute: "legacy",
-			PaidImageModel: "gpt-image-2",
-		},
-	}
-
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate() returned error: %v", err)
-	}
-	if cfg.ChatGPT.FreeImageRoute != "legacy" {
-		t.Fatalf("FreeImageRoute = %q, want legacy", cfg.ChatGPT.FreeImageRoute)
-	}
-	if cfg.ChatGPT.FreeImageModel != "gpt-image-2" {
-		t.Fatalf("FreeImageModel = %q, want gpt-image-2", cfg.ChatGPT.FreeImageModel)
-	}
-	if cfg.ChatGPT.PaidImageModel != "gpt-image-2" {
-		t.Fatalf("PaidImageModel = %q, want gpt-image-2", cfg.ChatGPT.PaidImageModel)
-	}
-}
-
 func TestValidateDefaultsImageConversationAndDataStorageToBrowser(t *testing.T) {
 	cfg := &Config{
 		Storage: StorageConfig{
@@ -248,9 +146,7 @@ func TestValidateDefaultsImageConversationAndDataStorageToBrowser(t *testing.T) 
 			ConfigBackend: "file",
 		},
 		ChatGPT: ChatGPTConfig{
-			ImageMode:      "studio",
-			FreeImageRoute: "legacy",
-			PaidImageRoute: "responses",
+			ImageMode: "studio",
 		},
 	}
 
@@ -273,9 +169,7 @@ func TestValidateMigratesLegacyImageStorageToNewFields(t *testing.T) {
 			ImageStorage:  "server",
 		},
 		ChatGPT: ChatGPTConfig{
-			ImageMode:      "studio",
-			FreeImageRoute: "legacy",
-			PaidImageRoute: "responses",
+			ImageMode: "studio",
 		},
 	}
 
@@ -299,9 +193,7 @@ func TestValidateCoercesMismatchedImageStorageModes(t *testing.T) {
 			ImageDataStorage:         "browser",
 		},
 		ChatGPT: ChatGPTConfig{
-			ImageMode:      "studio",
-			FreeImageRoute: "legacy",
-			PaidImageRoute: "responses",
+			ImageMode: "studio",
 		},
 	}
 

@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -184,25 +183,6 @@ func (s *Server) runStartupCheck(ctx context.Context) startupCheckResponse {
 		return checkStatusPass, fmt.Sprintf("服务已启动：%s:%d", strings.TrimSpace(s.cfg.Server.Host), s.cfg.Server.Port), ""
 	})
 
-	addCheck("proxy", "代理连通性", func() (string, string, string) {
-		if !s.cfg.Proxy.Enabled {
-			return checkStatusWarn, "未启用代理", "如需走代理访问官方链路，请先启用并填写 proxy.url"
-		}
-		if err := outboundproxy.Validate(s.cfg.Proxy.URL); err != nil {
-			return checkStatusFail, fmt.Sprintf("代理配置无效：%v", err), "请检查代理 URL、协议与端口"
-		}
-		target, err := resolveProxyDialTarget(s.cfg.Proxy.URL)
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("代理地址解析失败：%v", err), ""
-		}
-		conn, dialErr := net.DialTimeout("tcp", target, 3*time.Second)
-		if dialErr != nil {
-			return checkStatusFail, fmt.Sprintf("代理不可达：%v", dialErr), "请确认代理程序已启动且端口正确"
-		}
-		_ = conn.Close()
-		return checkStatusPass, fmt.Sprintf("代理可连接：%s", target), ""
-	})
-
 	addCheck("cpa", "CPA 服务连通", func() (string, string, string) {
 		baseURL := strings.TrimSpace(s.cfg.CPAImageBaseURL())
 		if baseURL == "" {
@@ -274,29 +254,6 @@ func probeEndpoint(parent context.Context, targetURL, proxyURL string, timeout t
 	return resp.StatusCode, nil
 }
 
-func resolveProxyDialTarget(raw string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return "", err
-	}
-	host := parsed.Hostname()
-	if strings.TrimSpace(host) == "" {
-		return "", fmt.Errorf("proxy host is empty")
-	}
-	port := parsed.Port()
-	if port == "" {
-		switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
-		case "socks5", "socks5h":
-			port = "1080"
-		case "https":
-			port = "443"
-		default:
-			port = "80"
-		}
-	}
-	return net.JoinHostPort(host, port), nil
-}
-
 func normalizeProbeURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -312,13 +269,6 @@ func (s *Server) maskSensitiveConfig(payload configPayload) configPayload {
 	payload.App.APIKey = maskSecret(payload.App.APIKey)
 	payload.App.AuthKey = maskSecret(payload.App.AuthKey)
 	payload.CPA.APIKey = maskSecret(payload.CPA.APIKey)
-	payload.Sync.ManagementKey = maskSecret(payload.Sync.ManagementKey)
-	payload.Proxy.URL = maskURLAuth(payload.Proxy.URL)
-	payload.NewAPI.Password = maskSecret(payload.NewAPI.Password)
-	payload.NewAPI.AccessToken = maskSecret(payload.NewAPI.AccessToken)
-	payload.NewAPI.SessionCookie = maskSecret(payload.NewAPI.SessionCookie)
-	payload.Sub2API.Password = maskSecret(payload.Sub2API.Password)
-	payload.Sub2API.APIKey = maskSecret(payload.Sub2API.APIKey)
 	return payload
 }
 

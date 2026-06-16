@@ -27,43 +27,12 @@ sse_timeout = 600
 poll_interval = 3
 poll_max_wait = 600
 request_timeout = 120
-image_mode = "studio"
-
-# Free 账号图片请求走哪条链路：
-# legacy    -> 当前项目原有的 /backend-api/conversation 流程
-# responses -> 官方 /backend-api/codex/responses 流程
-# 默认建议保留 legacy，因为 Free 账号通常没有 image_generation 工具权限。
-free_image_route = "legacy"
-
-# Free 账号真正发给上游的模型名。
-# 默认 auto，表示保留旧行为，让上游自动选择兼容模型。
-free_image_model = "auto"
-
-# Plus / Pro / Team 账号图片请求走哪条链路。
-# 默认 responses，表示优先走官方 codex / responses。
-# 注意：这条 paid 默认链路当前尚未经过真实付费账号端到端实测。
-paid_image_route = "responses"
-
-# Plus / Pro / Team 账号真正发给上游的模型名。
-# 默认 gpt-5.4-mini，也可以改成 gpt-5.4。
-paid_image_model = "gpt-5.4-mini"
-
-# Studio 模式下，是否允许“已禁用但仍有图片额度”的账号继续参与图片生成。
-# 仅对 Studio 模式生效；CPA 不受影响。
-studio_allow_disabled_image_accounts = false
-
-[accounts]
-default_quota = 5
-prefer_remote_refresh = true
-refresh_workers = 6
-image_quota_refresh_ttl_seconds = 120
+# 后端自 phase 7 起仅支持 cpa 单一模式；旧 studio/mix 值会归一化为 cpa。
+image_mode = "cpa"
 
 [storage]
 backend = "current"
 config_backend = "file"
-auth_dir = "data/auths"
-state_file = "data/accounts_state.json"
-sync_state_dir = "data/sync_state"
 image_dir = "data/tmp/image"
 image_storage = "browser"
 image_conversation_storage = "browser"
@@ -74,50 +43,13 @@ redis_password = ""
 redis_db = 0
 redis_prefix = "chatgpt2api:studio"
 
-# CLIProxyAPI / CPA 同步配置。
-# 如果你暂时不需要远端号池同步，请保持 enabled=false。
-[sync]
-enabled = false
-base_url = ""
-management_key = ""
-request_timeout = 20
-concurrency = 4
-provider_type = "codex"
-
-# 固定代理配置。用于访问 ChatGPT 官方接口。
-# 当前仅支持 fixed 模式，url 支持 socks5 / socks5h / http / https。
-# 如果 sync_enabled = true，CPA 同步请求也会复用同一代理。
-[proxy]
-enabled = false
-url = "socks5h://127.0.0.1:10808"
-mode = "fixed"
-sync_enabled = false
-
-# CPA 图片接口配置。
-# 当 image_mode = "cpa" 时会使用这里的 base_url / api_key。
-# 如果 cpa.base_url 为空，会回退复用 sync.base_url。
+# CPA 图片接口配置。多租户部署下 base_url / api_key 由凭证 resolver 按用户注入；
+# 这里的值仅作为单机/兜底配置。
 [cpa]
 base_url = ""
 api_key = ""
 request_timeout = 60
 route_strategy = "images_api"
-
-[newapi]
-base_url = ""
-username = ""
-password = ""
-access_token = ""
-user_id = 0
-session_cookie = ""
-request_timeout = 20
-
-[sub2api]
-base_url = ""
-email = ""
-password = ""
-api_key = ""
-group_id = ""
-request_timeout = 20
 
 # 多租户身份：母系统签发的一次性 RS256 入口票据 + image-studio 自有会话。
 # 仅在嵌入母系统的多租户部署下需要配置；单机模式可留空。
