@@ -137,25 +137,26 @@ func TestPhase6SourceImageReuseCrossTenantDenied(t *testing.T) {
 
 // --- §8 regression: import endpoint rejects storage-backend coordinates ---
 
-// newImportTestServer builds a server in server-storage mode authed by a legacy
-// bearer key (resolves to legacyDefaultUserID), with a file backend rooted in a
-// temp dir. It returns the server, its handler, the auth key, and the temp root
-// so the test can assert where data actually landed.
-func newImportTestServer(t *testing.T) (*Server, http.Handler, string, string) {
+// newImportTestServer builds a server in server-storage mode with a file
+// backend rooted in a temp dir. Requests authenticate with a session cookie
+// (minted for defaultTestUserID). It returns the server, its handler, an
+// auth cookie, and the temp root so the test can assert where data landed.
+func newImportTestServer(t *testing.T) (*Server, http.Handler, *http.Cookie, string) {
 	t.Helper()
 	root := t.TempDir()
 	cfg := config.New(root)
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	cfg.App.AuthKey = "test-import-key"
+	cfg.Identity.SessionSecret = "test-session-secret"
+	cfg.Identity.SessionTTLSeconds = 3600
 	cfg.Storage.Backend = "current"
 	cfg.Storage.ImageDir = "data/images"
 	cfg.Storage.ImageConversationStorage = "server"
 	cfg.Storage.ImageDataStorage = "server"
 	cfg.Storage.ImageStorage = "server"
 	server := NewServer(cfg)
-	return server, server.Handler(), cfg.App.AuthKey, root
+	return server, server.Handler(), mintTestSession(t, server, defaultTestUserID), root
 }
 
 // TestPhase6ImportIgnoresStorageCoordinates proves the import endpoint accepts
@@ -165,7 +166,7 @@ func newImportTestServer(t *testing.T) (*Server, http.Handler, string, string) {
 // Data must land in the server's own configured store under the caller's userID,
 // never in the attacker-supplied location.
 func TestPhase6ImportIgnoresStorageCoordinates(t *testing.T) {
-	_, handler, authKey, root := newImportTestServer(t)
+	_, handler, authCookie, root := newImportTestServer(t)
 
 	// A directory the attacker tries to redirect storage into. If the handler
 	// honored coordinates, conversation files would appear here.
@@ -203,7 +204,7 @@ func TestPhase6ImportIgnoresStorageCoordinates(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/image/conversations/import", bytes.NewReader(raw))
-	req.Header.Set("Authorization", "Bearer "+authKey)
+	req.AddCookie(authCookie)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -218,9 +219,9 @@ func TestPhase6ImportIgnoresStorageCoordinates(t *testing.T) {
 	}
 
 	// Data must be readable from the server's OWN configured store via the list
-	// endpoint, scoped to the caller's userID (legacy bearer → legacyDefaultUserID).
+	// endpoint, scoped to the caller's userID (legacy bearer → defaultTestUserID).
 	listReq := httptest.NewRequest(http.MethodGet, "/api/image/conversations", nil)
-	listReq.Header.Set("Authorization", "Bearer "+authKey)
+	listReq.AddCookie(authCookie)
 	listRec := httptest.NewRecorder()
 	handler.ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {

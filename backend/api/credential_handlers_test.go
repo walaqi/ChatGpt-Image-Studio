@@ -204,8 +204,9 @@ func TestResolveImageCredentialUsesRememberedSelection(t *testing.T) {
 	}
 }
 
-func TestResolveImageCredentialFallbackToConfig(t *testing.T) {
-	// No credService → single-tenant fallback to global [cpa] config.
+func TestResolveImageCredentialRequiresCredService(t *testing.T) {
+	// Phase 7 removed the single-tenant fallback: with no credService configured
+	// the pipeline must refuse rather than borrow the global [cpa] config.
 	cfg := config.New(t.TempDir())
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -213,13 +214,10 @@ func TestResolveImageCredentialFallbackToConfig(t *testing.T) {
 	cfg.CPA.BaseURL = "http://cpa/v1"
 	cfg.CPA.APIKey = "sk-global"
 	server := NewServer(cfg)
-	server.credService = nil // force fallback
+	server.credService = nil // no mother-system callback configured
 
-	cred, err := server.resolveImageCredential(context.Background())
-	if err != nil {
-		t.Fatalf("resolveImageCredential fallback: %v", err)
-	}
-	if cred.APIKey != "sk-global" || cred.BaseURL != "http://cpa/v1" {
-		t.Fatalf("cred = %+v, want global cpa config", cred)
+	ctx := identity.WithUserID(context.Background(), "12345")
+	if _, err := server.resolveImageCredential(ctx); err == nil {
+		t.Fatal("expected error when credService is unconfigured, got nil")
 	}
 }

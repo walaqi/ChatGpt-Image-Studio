@@ -24,7 +24,7 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 		"size":"1248x1248",
 		"quality":"high"
 	}`))
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -49,7 +49,7 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 
 	waitForTaskStatus(t, server, payload.Task.ID, imageTaskStatusSucceeded)
 
-	task, _, err := server.imageTasks.getTask(legacyDefaultUserID, payload.Task.ID)
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, payload.Task.ID)
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCreateImageTaskSelectionEditRunsInpaint(t *testing.T) {
 			"source_account_id":"acct-1"
 		}
 	}`))
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -124,7 +124,7 @@ func TestCreateImageTaskSelectionEditRunsInpaint(t *testing.T) {
 func TestImageTaskStreamWritesInitPayload(t *testing.T) {
 	server, _ := newCPATestServer(t)
 
-	if _, err := server.imageTasks.createTask(legacyDefaultUserID, createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-stream-1",
 		TurnID:         "turn-stream-1",
 		Mode:           "generate",
@@ -139,7 +139,7 @@ func TestImageTaskStreamWritesInitPayload(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/image/tasks/stream", nil).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	rec := httptest.NewRecorder()
 
 	var wg sync.WaitGroup
@@ -220,7 +220,7 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 	server, _ := newCPATestServer(t)
 	useParallelCPAClient(server, 180*time.Millisecond)
 
-	if _, err := server.imageTasks.createTask(legacyDefaultUserID, createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-cancel-1",
 		TurnID:         "turn-cancel-1",
 		Mode:           "generate",
@@ -235,13 +235,13 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.cancelTask(legacyDefaultUserID, "turn-cancel-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask(defaultTestUserID, "turn-cancel-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
 	waitForTaskStatus(t, server, "turn-cancel-1", imageTaskStatusCancelled)
 
-	task, _, err := server.imageTasks.getTask(legacyDefaultUserID, "turn-cancel-1")
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, "turn-cancel-1")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 	server, _ := newCPATestServer(t)
 	useParallelCPAClient(server, 5*time.Second)
 
-	if _, err := server.imageTasks.createTask(legacyDefaultUserID, createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-cancel-fast-1",
 		TurnID:         "turn-cancel-fast-1",
 		Mode:           "generate",
@@ -276,7 +276,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 	})
 
 	startedAt := time.Now()
-	if _, err := server.imageTasks.cancelTask(legacyDefaultUserID, "turn-cancel-fast-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask(defaultTestUserID, "turn-cancel-fast-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
@@ -328,7 +328,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 	server.cfg.Server.ImageTaskQueueTTLSeconds = 1
 	useParallelCPAClient(server, 1500*time.Millisecond)
 
-	if _, err := server.imageTasks.createTask(legacyDefaultUserID, createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-expire-runner",
 		TurnID:         "turn-expire-runner",
 		Mode:           "generate",
@@ -342,7 +342,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.createTask(legacyDefaultUserID, createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-expire-queued",
 		TurnID:         "turn-expire-queued",
 		Mode:           "generate",
@@ -355,7 +355,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 
 	waitForTaskStatus(t, server, "turn-expire-queued", imageTaskStatusExpired)
 
-	task, _, err := server.imageTasks.getTask(legacyDefaultUserID, "turn-expire-queued")
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, "turn-expire-queued")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestCompletedImageTaskIsPrunedAfterRetention(t *testing.T) {
 		t.Fatal("tryScheduleOne() = false, want prune cycle to run")
 	}
 
-	if _, _, err := server.imageTasks.getTask(legacyDefaultUserID, task.ID); err == nil {
+	if _, _, err := server.imageTasks.getTask(defaultTestUserID, task.ID); err == nil {
 		t.Fatalf("getTask(%s) error = nil, want pruned task to be removed", task.ID)
 	}
 	items, snapshot := server.imageTasks.listTasks("")

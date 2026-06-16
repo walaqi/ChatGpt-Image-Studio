@@ -244,7 +244,6 @@ func storageSettingsChanged(previous, next configPayload) bool {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.Handle("POST /auth/login", http.HandlerFunc(s.handleLogin))
 	mux.Handle("POST /auth/session", http.HandlerFunc(s.handleSession))
 	mux.Handle("GET /version", http.HandlerFunc(s.handleVersion))
 	mux.Handle("GET /health", http.HandlerFunc(handleHealth))
@@ -278,17 +277,6 @@ func (s *Server) Handler() http.Handler {
 
 	handler := middleware.RequestID(middleware.Logger(mux))
 	return middleware.CORS(handler)
-}
-
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if !s.hasExactBearer(r, s.cfg.App.AuthKey) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authorization is invalid"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"version": buildinfo.ResolveVersion(s.cfg.App.Version),
-	})
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
@@ -565,14 +553,7 @@ func (s *Server) cpaCredentialFromConfig() credential.Credential {
 // on to drive the picker / guidance UI.
 func (s *Server) resolveImageCredential(ctx context.Context) (credential.Credential, error) {
 	if s.credService == nil {
-		// Single-tenant fallback: global config must be configured.
-		if !s.cfg.CPAImageConfigured() {
-			return credential.Credential{}, newRequestError("cpa_image_not_configured", "CPA 图片接口还未配置，请先在配置管理中设置 CPA base_url 与 api_key")
-		}
-		return credential.Credential{
-			BaseURL: s.cfg.CPAImageBaseURL(),
-			APIKey:  s.cfg.CPAImageAPIKey(),
-		}, nil
+		return credential.Credential{}, newRequestError("credential_service_unavailable", "凭证服务未配置，请联系管理员")
 	}
 
 	userID, ok := identity.UserIDFromContext(ctx)
@@ -796,33 +777,24 @@ func (s *Server) handleWebApp(w http.ResponseWriter, r *http.Request) {
 // sessionCookieName is the HttpOnly cookie carrying image-studio's own session.
 const sessionCookieName = "studio_sid"
 
-// legacyDefaultUserID is the tenant assigned to requests authorized via the
-// legacy single-tenant bearer key (no session cookie). In single-tenant/dev
-// mode every request maps to this one user. Removed in phase 7.
-const legacyDefaultUserID = "default"
-
-// requireUIAuth gates the management/UI API. In the multi-tenant model it
-// accepts a valid session cookie; for backward compatibility (single-tenant,
-// dev, tests) it also accepts the legacy auth_key bearer. Either way the
-// resolved userID is injected into the request context.
+// requireUIAuth gates the management/UI API. It requires a valid image-studio
+// session cookie (minted by POST /auth/session from a mother-system entry
+// ticket); the resolved userID is injected into the request context.
 func (s *Server) requireUIAuth(next http.Handler) http.Handler {
-	return s.requireSession(next, nil)
+	return s.requireSession(next)
 }
 
-// requireImageAuth gates the OpenAI-compatible /v1 image API. Same as
-// requireUIAuth but the legacy fallback additionally accepts the configured
-// api_key comma-list (used by external API clients today).
+// requireImageAuth gates the OpenAI-compatible /v1 image API. Same contract as
+// requireUIAuth: session cookie only, no legacy bearer.
 func (s *Server) requireImageAuth(next http.Handler) http.Handler {
-	return s.requireSession(next, parseKeys(s.cfg.App.APIKey))
+	return s.requireSession(next)
 }
 
-// requireSession resolves the caller's userID (session cookie first, then
-// legacy bearer keys) and injects it into the request context. On failure it
-// returns 401. extraLegacyKeys are additional bearer keys accepted on the
-// legacy path (beyond auth_key).
-func (s *Server) requireSession(next http.Handler, extraLegacyKeys []string) http.Handler {
+// requireSession resolves the caller's userID from the session cookie and
+// injects it into the request context. On failure it returns 401.
+func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userID, ok := s.resolveUserID(r, extraLegacyKeys)
+		userID, ok := s.resolveUserID(r)
 		if !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authorization is invalid"})
 			return
@@ -831,40 +803,21 @@ func (s *Server) requireSession(next http.Handler, extraLegacyKeys []string) htt
 	})
 }
 
-// resolveUserID returns the authenticated userID and whether the request is
-// authorized. Resolution order:
-//  1. Valid session cookie (studio_sid) → its userID (multi-tenant path).
-//  2. Legacy bearer matching auth_key or one of extraLegacyKeys → legacyDefaultUserID.
-func (s *Server) resolveUserID(r *http.Request, extraLegacyKeys []string) (string, bool) {
-	if s.sessionManager != nil {
-		if cookie, err := r.Cookie(sessionCookieName); err == nil {
-			if userID, verr := s.sessionManager.Verify(cookie.Value); verr == nil {
-				return userID, true
-			}
-		}
+// resolveUserID returns the authenticated userID from a valid session cookie
+// (studio_sid) and whether the request is authorized.
+func (s *Server) resolveUserID(r *http.Request) (string, bool) {
+	if s.sessionManager == nil {
+		return "", false
 	}
-	legacyKeys := append([]string{s.cfg.App.AuthKey}, extraLegacyKeys...)
-	if s.hasAnyBearer(r, legacyKeys...) {
-		return legacyDefaultUserID, true
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return "", false
 	}
-	return "", false
-}
-
-func (s *Server) hasAnyBearer(r *http.Request, keys ...string) bool {
-	token := bearerFromRequest(r)
-	if token == "" {
-		return false
+	userID, verr := s.sessionManager.Verify(cookie.Value)
+	if verr != nil {
+		return "", false
 	}
-	for _, key := range keys {
-		if strings.TrimSpace(key) != "" && token == strings.TrimSpace(key) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) hasExactBearer(r *http.Request, key string) bool {
-	return strings.TrimSpace(key) != "" && bearerFromRequest(r) == strings.TrimSpace(key)
+	return userID, true
 }
 
 // requestIsTLS reports whether the original client connection used HTTPS,
@@ -893,16 +846,6 @@ func bearerFromRequest(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
-}
-
-func parseKeys(raw string) []string {
-	result := make([]string, 0)
-	for _, item := range strings.Split(raw, ",") {
-		if cleaned := strings.TrimSpace(item); cleaned != "" {
-			result = append(result, cleaned)
-		}
-	}
-	return result
 }
 
 func resolveStaticAsset(staticDir, requestPath string) string {

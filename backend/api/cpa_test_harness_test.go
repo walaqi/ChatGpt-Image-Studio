@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,15 +12,34 @@ import (
 
 	"chatgpt2api/handler"
 	"chatgpt2api/internal/config"
+	"chatgpt2api/internal/credential"
 )
+
+// defaultTestUserID is the canonical tenant used by harness-built tests. Phase 7
+// removed the legacy single-tenant bearer, so tests mint a session for this user
+// (mintTestSession) or call the task manager directly with this ID.
+const defaultTestUserID = "default"
 
 // --- cpa-only test harness ---
 //
-// Phase 7 deleted the studio account pool, so the old account-seeding harness
-// (newImageModeCompatTestServerWithOptions) is gone. These helpers build a
-// server in the single-tenant CPA fallback mode (no credService → global [cpa]
-// config) with a stub CPA workflow client, which is all the surviving task /
-// compat lifecycle tests need.
+// Phase 7 deleted the studio account pool AND the single-tenant fallback, so
+// the old account-seeding harness (newImageModeCompatTestServerWithOptions) is
+// gone and every request must carry a session-derived userID with a resolvable
+// per-user credential. These helpers build a multi-tenant CPA server wired to a
+// permissive in-memory credService (every userID resolves to a stub credential)
+// plus a stub CPA workflow client, which is all the surviving task / compat
+// lifecycle tests need.
+
+// mintTestSession mints a studio_sid session cookie for userID so HTTP tests
+// authenticate the same way the browser does (no legacy bearer post-phase-7).
+func mintTestSession(t *testing.T, server *Server, userID string) *http.Cookie {
+	t.Helper()
+	token, err := server.sessionManager.Mint(userID)
+	if err != nil {
+		t.Fatalf("mint session: %v", err)
+	}
+	return &http.Cookie{Name: sessionCookieName, Value: token}
+}
 
 // cpaCallRecorder captures stub CPA client invocations for assertions.
 type cpaCallRecorder struct {
@@ -116,10 +136,29 @@ func (c *cpaStubWorkflowClient) InpaintImageByMask(ctx context.Context, prompt s
 func (c *cpaStubWorkflowClient) LastRoute() string      { return c.route }
 func (c *cpaStubWorkflowClient) LastModelLabel() string { return c.model }
 
-// newCPATestServer builds a single-tenant CPA-mode server with a stub CPA
-// client and a call recorder. Tasks/compat requests authorize via the legacy
-// auth_key bearer → legacyDefaultUserID, and credentials resolve from the
-// global [cpa] config (credService stays nil).
+// alwaysResolver is a permissive credential.Resolver for the cpa harness: every
+// (userID, keyID) resolves to the same stub-backed credential. Phase 7 removed
+// the global-[cpa]-config fallback, so a credService is now mandatory even for
+// single-tenant tests; this stands in for the mother system.
+type alwaysResolver struct {
+	cred credential.Credential
+}
+
+func (r *alwaysResolver) ListKeys(_ context.Context, _ string) (credential.KeyListResult, error) {
+	return credential.KeyListResult{
+		Keys:      []credential.KeyCandidate{{KeyID: 1, Name: "stub"}},
+		CanCreate: true,
+	}, nil
+}
+
+func (r *alwaysResolver) Resolve(_ context.Context, _ string, _ int64) (credential.Credential, error) {
+	return r.cred, nil
+}
+
+// newCPATestServer builds a CPA-mode server with a stub CPA client and a call
+// recorder. A permissive credService resolves every user to the stub credential
+// and the default tenant's key selection is pre-seeded, so direct createTask
+// calls succeed. HTTP tests authenticate with mintTestSession.
 func newCPATestServer(t *testing.T) (*Server, *cpaCallRecorder) {
 	t.Helper()
 
@@ -127,8 +166,6 @@ func newCPATestServer(t *testing.T) (*Server, *cpaCallRecorder) {
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	cfg.App.APIKey = "test-image-key"
-	cfg.App.AuthKey = "test-ui-key"
 	cfg.App.ImageFormat = "b64_json"
 	cfg.ChatGPT.Model = "gpt-image-2"
 	cfg.ChatGPT.ImageMode = "cpa"
@@ -136,8 +173,21 @@ func newCPATestServer(t *testing.T) (*Server, *cpaCallRecorder) {
 	cfg.CPA.APIKey = "test-cpa-key"
 	cfg.CPA.RequestTimeout = 60
 	cfg.CPA.RouteStrategy = "images_api"
+	cfg.Identity.SessionSecret = "test-session-secret"
+	cfg.Identity.SessionTTLSeconds = 3600
 
 	server := NewServer(cfg)
+
+	resolver := &alwaysResolver{cred: credential.Credential{
+		BaseURL: cfg.CPA.BaseURL,
+		APIKey:  cfg.CPA.APIKey,
+	}}
+	selection := credential.NewMemorySelectionStore()
+	if err := selection.Set(context.Background(), defaultTestUserID, 1); err != nil {
+		t.Fatalf("seed selection: %v", err)
+	}
+	server.credService = credential.NewService(resolver, selection)
+
 	recorder := &cpaCallRecorder{}
 	server.cpaClientFactory = func(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) cpaRouteAwareImageWorkflowClient {
 		_ = baseURL
@@ -179,14 +229,14 @@ func waitForTaskStatus(t *testing.T, server *Server, taskID string, want imageTa
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(legacyDefaultUserID, taskID)
+		task, _, err := server.imageTasks.getTask(defaultTestUserID, taskID)
 		if err == nil && task != nil && imageTaskStatus(task.Status) == want {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	task, _, err := server.imageTasks.getTask(legacyDefaultUserID, taskID)
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, taskID)
 	if err != nil {
 		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
 	}
@@ -197,14 +247,14 @@ func waitForTaskPredicate(t *testing.T, server *Server, taskID string, predicate
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(legacyDefaultUserID, taskID)
+		task, _, err := server.imageTasks.getTask(defaultTestUserID, taskID)
 		if err == nil && task != nil && predicate(task) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	task, _, err := server.imageTasks.getTask(legacyDefaultUserID, taskID)
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, taskID)
 	if err != nil {
 		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
 	}
