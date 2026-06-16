@@ -107,13 +107,16 @@ export type VersionInfo = {
 };
 
 // CredentialKeyCandidate is one image-capable key the user can pick (no
-// plaintext — only display metadata). See docs/multi-tenant-redesign.md §4.2.
+// plaintext — only display metadata). Field shapes match the mother system's
+// GET /internal/cred/keys response: quota is a number (0 = unlimited),
+// expires_at is a Unix-second timestamp or null (never expires).
 export type CredentialKeyCandidate = {
   key_id: number;
   name: string;
   quota: number;
   quota_used: number;
-  expires_at: string;
+  expires_at: number | null;
+  group_id: number;
   group_name: string;
 };
 

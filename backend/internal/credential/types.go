@@ -17,13 +17,17 @@ import (
 )
 
 // KeyCandidate describes one image-capable key the user owns. It deliberately
-// carries no plaintext key — only metadata for the picker UI.
+// carries no plaintext key — only metadata for the picker UI. The field shapes
+// match the mother system's GET /internal/cred/keys response (see
+// docs/comments-from-mother.md §D): quota is a float (0 = unlimited),
+// expires_at is a Unix-second timestamp or null (永不过期).
 type KeyCandidate struct {
 	KeyID     int64   `json:"key_id"`
 	Name      string  `json:"name"`
 	Quota     float64 `json:"quota"`
 	QuotaUsed float64 `json:"quota_used"`
-	ExpiresAt string  `json:"expires_at"`
+	ExpiresAt *int64  `json:"expires_at"`
+	GroupID   int64   `json:"group_id"`
 	GroupName string  `json:"group_name"`
 }
 

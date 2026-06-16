@@ -29,14 +29,14 @@ import { cn } from "@/lib/utils";
 // user's image-capable keys, remembers the chosen one, and guides the user back
 // to the mother system when no usable key exists.
 
-function formatExpiry(value: string) {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) {
+function formatExpiry(value: number | null) {
+  if (value === null || value === undefined) {
     return "长期有效";
   }
-  const date = new Date(trimmed);
+  // The mother system returns a Unix-second timestamp.
+  const date = new Date(value * 1000);
   if (Number.isNaN(date.getTime())) {
-    return trimmed;
+    return "长期有效";
   }
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
@@ -46,6 +46,10 @@ function formatExpiry(value: string) {
 }
 
 function formatQuota(candidate: CredentialKeyCandidate) {
+  // quota 0 means unlimited (mother system convention).
+  if (candidate.quota === 0) {
+    return "不限";
+  }
   const remaining = Math.max(0, candidate.quota - candidate.quota_used);
   return `${remaining} / ${candidate.quota}`;
 }

@@ -46,7 +46,10 @@ func TestListKeysHappyPath(t *testing.T) {
 			t.Errorf("missing/invalid X-Internal-Secret header")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"keys":[{"key_id":7,"name":"img","quota":10,"quota_used":2,"group_name":"g"}],"can_create":true,"image_group_id":9}`))
+		// Mirror the mother system's real response shape (comments-from-mother.md
+		// §D): expires_at is a Unix-second integer (or null), and candidates carry
+		// group_id. The first key has a numeric expiry, the second is null.
+		_, _ = w.Write([]byte(`{"keys":[{"key_id":7,"name":"img","quota":10,"quota_used":2,"expires_at":1788192000,"group_id":4,"group_name":"g"},{"key_id":8,"name":"img2","quota":0,"quota_used":0,"expires_at":null,"group_id":4,"group_name":"g"}],"can_create":true,"image_group_id":9}`))
 	}))
 	defer srv.Close()
 
@@ -55,8 +58,17 @@ func TestListKeysHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListKeys: %v", err)
 	}
-	if len(res.Keys) != 1 || res.Keys[0].KeyID != 7 {
+	if len(res.Keys) != 2 || res.Keys[0].KeyID != 7 {
 		t.Fatalf("unexpected keys: %+v", res.Keys)
+	}
+	if res.Keys[0].ExpiresAt == nil || *res.Keys[0].ExpiresAt != 1788192000 {
+		t.Fatalf("expires_at not decoded: %+v", res.Keys[0])
+	}
+	if res.Keys[0].GroupID != 4 {
+		t.Fatalf("group_id not decoded: %+v", res.Keys[0])
+	}
+	if res.Keys[1].ExpiresAt != nil {
+		t.Fatalf("null expires_at should decode to nil, got %+v", res.Keys[1].ExpiresAt)
 	}
 	if !res.CanCreate || res.ImageGroupID == nil || *res.ImageGroupID != 9 {
 		t.Fatalf("unexpected can_create/image_group_id: %+v", res)
