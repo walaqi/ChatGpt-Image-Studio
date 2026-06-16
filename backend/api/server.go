@@ -111,8 +111,8 @@ func (s *Server) initIdentity() {
 
 // initCredential builds the per-user credential service when the mother-system
 // callback is configured ([credential] endpoint_base + internal_secret). When
-// unconfigured, credService stays nil and the image pipeline falls back to the
-// global [cpa] config so single-tenant/dev deployments keep working.
+// unconfigured, credService stays nil and image requests fail fast (phase 7 is
+// cpa-only with no single-tenant fallback — see resolveImageCredential).
 func (s *Server) initCredential() {
 	base := strings.TrimSpace(s.cfg.Credential.EndpointBase)
 	secret := strings.TrimSpace(s.cfg.Credential.InternalSecret)
@@ -430,22 +430,13 @@ func (s *Server) newCPAWorkflowClient(cred credential.Credential) cpaRouteAwareI
 	)
 }
 
-// cpaCredentialFromConfig builds a credential from global CPA config, used as
-// the single-tenant/dev fallback when no per-user credential service is
-// configured.
-func (s *Server) cpaCredentialFromConfig() credential.Credential {
-	return credential.Credential{
-		BaseURL: s.cfg.CPAImageBaseURL(),
-		APIKey:  s.cfg.CPAImageAPIKey(),
-	}
-}
-
 // resolveImageCredential returns the channel credential for the current request.
-// In multi-tenant mode (credService configured) it resolves the per-user
-// remembered key; the userID comes from the request context (injected by the
-// session middleware, or by the async task executor — see phase 4). When no
-// credService is configured it falls back to the global [cpa] config so
-// single-tenant/dev deployments keep working.
+// The credential is always resolved per-user (phase 7 is cpa-only, no
+// single-tenant fallback): the userID comes from the request context (injected
+// by the session middleware, or by the async task executor — see phase 4) and
+// the user's remembered key is resolved via credService. When credService is
+// not configured the request fails fast rather than falling back to a shared
+// upstream.
 //
 // Returned errors are *requestError values with stable codes the frontend keys
 // on to drive the picker / guidance UI.
