@@ -122,6 +122,49 @@ func TestImageFileOwnershipEnforced(t *testing.T) {
 	}
 }
 
+// TestImageFileServedWithPublicBasePathPrefix proves that when PublicBasePath is
+// set, the image URL baked with that prefix (e.g. /image-studio/v1/files/image/...)
+// resolves directly — covering direct dev access where no reverse proxy strips
+// the prefix. Both the prefixed and bare paths must serve the same file.
+func TestImageFileServedWithPublicBasePathPrefix(t *testing.T) {
+	server, mint := newTenantTestServer(t)
+	server.cfg.Server.PublicBasePath = "/image-studio"
+	handler := server.Handler()
+
+	userADir := filepath.Join(server.cfg.ResolvePath(server.cfg.Storage.ImageDir), "userA")
+	if err := os.MkdirAll(userADir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userADir, "result-x.png"), []byte("png-bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, path := range []string{
+		"/image-studio/v1/files/image/userA/result-x.png", // prefixed (direct dev / proxy not stripping)
+		"/v1/files/image/userA/result-x.png",              // bare (proxy stripped the prefix)
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(mint("userA"))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", path, rec.Code)
+		}
+		if rec.Body.String() != "png-bytes" {
+			t.Fatalf("GET %s body = %q, want png-bytes", path, rec.Body.String())
+		}
+	}
+
+	// Cross-tenant guard still holds on the prefixed route.
+	reqB := httptest.NewRequest(http.MethodGet, "/image-studio/v1/files/image/userA/result-x.png", nil)
+	reqB.AddCookie(mint("userB"))
+	recB := httptest.NewRecorder()
+	handler.ServeHTTP(recB, reqB)
+	if recB.Code != http.StatusForbidden {
+		t.Fatalf("userB via prefixed path = %d, want 403", recB.Code)
+	}
+}
+
 // TestGatewayImageURLPrefix verifies the public base path is prepended to the
 // absolute image URL so it routes back through the /image-studio reverse proxy.
 func TestGatewayImageURLPrefix(t *testing.T) {

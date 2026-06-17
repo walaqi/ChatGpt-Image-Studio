@@ -457,7 +457,7 @@ func (m *imageTaskManager) tryScheduleOne() bool {
 }
 
 func (m *imageTaskManager) runUnit(taskID string, unitIndex int, lease *imageTaskLease, ctx context.Context) {
-	images, err := m.server.executeImageTaskUnit(ctx, taskID, unitIndex, lease)
+	images, assistantText, err := m.server.executeImageTaskUnit(ctx, taskID, unitIndex, lease)
 	if lease != nil && lease.release != nil {
 		lease.release()
 	}
@@ -525,7 +525,28 @@ func (m *imageTaskManager) runUnit(taskID string, unitIndex int, lease *imageTas
 		image := images[0]
 		image.ID = task.Images[unitIndex].ID
 		image.Status = "success"
+		// On the Responses route the model may emit text alongside the image
+		// (e.g. a revised-prompt note). Carry it on the first image's turn so the
+		// conversation can show both.
+		if strings.TrimSpace(assistantText) != "" {
+			image.AssistantText = strings.TrimSpace(assistantText)
+		}
 		task.Images[unitIndex] = image
+	} else {
+		// No error and no image. On the Responses route this is a legitimate
+		// text-only reply (e.g. a content refusal that proposes an alternative).
+		// Mark the unit succeeded and surface the model's text instead of leaving
+		// the unit stuck in "running" forever (the old parser returned an error
+		// here, which mislabeled refusals as failures).
+		task.Units[unitIndex].FinishedAt = now
+		task.Units[unitIndex].Status = imageTaskStatusSucceeded
+		text := strings.TrimSpace(assistantText)
+		if text == "" {
+			text = "模型未生成图片，也未返回文字说明"
+		}
+		task.Images[unitIndex].Status = "text"
+		task.Images[unitIndex].Error = ""
+		task.Images[unitIndex].AssistantText = text
 	}
 
 	queuedUnits := 0

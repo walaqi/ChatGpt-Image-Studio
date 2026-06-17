@@ -23,7 +23,7 @@ export type StoredSourceImage = {
 
 export type StoredImage = {
   id: string;
-  status?: "loading" | "success" | "error";
+  status?: "loading" | "success" | "error" | "text";
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
@@ -33,6 +33,10 @@ export type StoredImage = {
   parent_message_id?: string;
   source_account_id?: string;
   error?: string;
+  // assistant_text is the model's textual reply for this turn (Responses route):
+  // shown alongside an image, or on its own for a text-only reply such as a
+  // content refusal. status "text" marks a text-only result (no image bytes).
+  assistant_text?: string;
 };
 
 export type ImageConversationStatus =
@@ -293,9 +297,14 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   if (
     image.status === "loading" ||
     image.status === "error" ||
-    image.status === "success"
+    image.status === "success" ||
+    image.status === "text"
   ) {
     return image;
+  }
+  // A result with no image bytes but a textual reply is a text-only turn.
+  if (!image.b64_json && !image.url && image.assistant_text) {
+    return { ...image, status: "text" };
   }
   return {
     ...image,

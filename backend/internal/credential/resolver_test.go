@@ -124,6 +124,65 @@ func TestResolveHappyPathAndGatewayOverride(t *testing.T) {
 	}
 }
 
+// TestListKeysUnwrapsEnvelope guards the real-world bug: the mother system wraps
+// every payload as {"code":0,"message":"success","data":{...}}. Decoding that
+// straight into KeyListResult matched no fields and yielded an all-zero result
+// (empty keys + can_create=false), which surfaced as a bogus "image feature not
+// enabled". The resolver must unwrap the envelope and read data.
+func TestListKeysUnwrapsEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"keys":[{"key_id":7,"name":"img","quota":10,"quota_used":2,"expires_at":null,"group_id":4,"group_name":"g"}],"can_create":true,"image_group_id":4}}`))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv, "")
+	res, err := r.ListKeys(context.Background(), "1")
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if len(res.Keys) != 1 || res.Keys[0].KeyID != 7 {
+		t.Fatalf("envelope keys not unwrapped: %+v", res.Keys)
+	}
+	if !res.CanCreate || res.ImageGroupID == nil || *res.ImageGroupID != 4 {
+		t.Fatalf("envelope can_create/image_group_id not unwrapped: %+v", res)
+	}
+}
+
+// TestListKeysEnvelopeNonZeroCode: a non-zero code inside a 2xx envelope is an
+// application-level error and must surface as an error, not a zero-value result.
+func TestListKeysEnvelopeNonZeroCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":40001,"message":"bad uid","data":{}}`))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv, "")
+	if _, err := r.ListKeys(context.Background(), "1"); err == nil {
+		t.Fatal("expected error for non-zero envelope code, got nil")
+	}
+}
+
+// TestResolveUnwrapsEnvelope: stage 2 has the same envelope, and decoding it
+// bare yielded an empty api_key → configured()==false → bogus ErrKeyUnusable.
+func TestResolveUnwrapsEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"api_key":"sk-xyz","base_url":"http://mother/v1","model":"gpt-image-2"}}`))
+	}))
+	defer srv.Close()
+
+	r := newTestResolver(t, srv, "")
+	cred, err := r.Resolve(context.Background(), "1", 7)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cred.APIKey != "sk-xyz" || cred.Model != "gpt-image-2" {
+		t.Fatalf("envelope credential not unwrapped: %+v", cred)
+	}
+}
+
 func TestResolveCachesByUserAndKey(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

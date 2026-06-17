@@ -51,8 +51,10 @@ redis_prefix = "chatgpt2api:studio"
 [cpa]
 base_url = ""
 api_key = ""
-request_timeout = 60
-route_strategy = "images_api"
+request_timeout = 60                  # 秒；出图整条请求（含读完响应体）的超时上限
+route_strategy = "codex_responses"    # images_api=/v1/images/generations（单轮）；codex_responses=/v1/responses（原生 SSE，支持多轮上下文）；auto=先 images_api 失败回退 responses
+responses_context_max_turns = 5       # 多轮上下文最多回放的历史轮数（0 关闭，按时间顺序拼）；仅 codex_responses/auto 路由生效
+responses_context_max_bytes = 8388608 # 重建 input 数组的近似字节预算（含内联图，默认 8 MiB）；超限从最早轮次砍起
 
 # 多租户身份：母系统签发的一次性 RS256 入口票据 + image-studio 自有会话。
 # 仅在嵌入母系统的多租户部署下需要配置；单机模式可留空。

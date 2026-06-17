@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"bufio"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -83,4 +86,24 @@ type statusWriter struct {
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Flush proxies to the underlying ResponseWriter's Flush so streaming responses
+// (the SSE task stream) are not swallowed by this logging wrapper. Without this,
+// `w.(http.Flusher)` in the SSE handler fails the type assertion against
+// *statusWriter and flushing silently becomes a no-op — events then stay buffered
+// until the connection closes, so the browser never sees incremental updates.
+func (w *statusWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Hijack proxies to the underlying ResponseWriter so connection-upgrade paths
+// (e.g. WebSocket) keep working through this wrapper.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }

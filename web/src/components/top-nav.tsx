@@ -2,14 +2,19 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { ChevronLeft, ImageIcon, LogOut, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { ChevronLeft, ImageIcon, LayoutDashboard, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
 import { fetchVersionInfo } from "@/lib/api";
-import { requestReauth } from "@/store/auth";
+import { requestReturnToConsole } from "@/store/auth";
 import { cn } from "@/lib/utils";
 import { ThemeToggleButton } from "@/components/theme-toggle-button";
 
 const repositoryUrl = "https://github.com/peiyizhi0724/ChatGpt-Image-Studio";
+
+// Temporarily hide the GitHub repo / version link in the sidebar footer. Kept as
+// a flag (rather than deleting the markup) so it can be re-enabled later if it
+// turns out to be useful.
+const SHOW_REPOSITORY_LINK = false;
 
 function formatVersionLabel(value: string) {
   const normalized = String(value || "").trim();
@@ -53,10 +58,10 @@ type DesktopTopNavProps = {
   pathname: string;
   defaultCollapsed: boolean;
   versionLabel: string;
-  onLogout: () => Promise<void>;
+  onReturnToConsole: () => void;
 };
 
-function DesktopTopNav({ pathname, defaultCollapsed, versionLabel, onLogout }: DesktopTopNavProps) {
+function DesktopTopNav({ pathname, defaultCollapsed, versionLabel, onReturnToConsole }: DesktopTopNavProps) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
 
   return (
@@ -131,30 +136,34 @@ function DesktopTopNav({ pathname, defaultCollapsed, versionLabel, onLogout }: D
         </nav>
 
         <div className="mt-auto space-y-3">
-          <a
-            href={repositoryUrl}
-            target="_blank"
-            rel="noreferrer"
-            className={cn(
-              "block rounded-2xl bg-white/70 text-xs text-stone-500 shadow-sm transition hover:bg-white hover:text-stone-700 dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text-muted)] dark:hover:bg-[var(--studio-panel-muted)] dark:hover:text-[var(--studio-text)]",
-              collapsed ? "px-2 py-3 text-center" : "px-4 py-3",
-            )}
-            title="打开 GitHub 仓库"
-          >
-            {!collapsed ? <div className="font-medium text-stone-700 dark:text-[var(--studio-text)]">版本</div> : null}
-            <div className={cn(!collapsed ? "mt-1" : "font-medium")}>{versionLabel}</div>
-          </a>
+          {/* The version / GitHub-repo link is temporarily hidden (kept here for
+              future use). Flip SHOW_REPOSITORY_LINK to re-enable it. */}
+          {SHOW_REPOSITORY_LINK ? (
+            <a
+              href={repositoryUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={cn(
+                "block rounded-2xl bg-white/70 text-xs text-stone-500 shadow-sm transition hover:bg-white hover:text-stone-700 dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text-muted)] dark:hover:bg-[var(--studio-panel-muted)] dark:hover:text-[var(--studio-text)]",
+                collapsed ? "px-2 py-3 text-center" : "px-4 py-3",
+              )}
+              title="打开 GitHub 仓库"
+            >
+              {!collapsed ? <div className="font-medium text-stone-700 dark:text-[var(--studio-text)]">版本</div> : null}
+              <div className={cn(!collapsed ? "mt-1" : "font-medium")}>{versionLabel}</div>
+            </a>
+          ) : null}
           <button
             type="button"
             className={cn(
               "flex w-full items-center rounded-2xl border border-stone-200 bg-white text-sm font-medium text-stone-700 transition hover:bg-stone-50 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:hover:bg-[var(--studio-panel-muted)]",
               collapsed ? "justify-center px-0 py-3" : "justify-center gap-2 px-4 py-3",
             )}
-            onClick={() => void onLogout()}
-            title={collapsed ? "退出登录" : undefined}
+            onClick={() => onReturnToConsole()}
+            title={collapsed ? "返回控制台" : undefined}
           >
-            <LogOut className="size-4" />
-            {!collapsed ? "退出登录" : null}
+            <LayoutDashboard className="size-4" />
+            {!collapsed ? "返回控制台" : null}
           </button>
         </div>
       </div>
@@ -266,11 +275,11 @@ export function TopNav() {
     };
   }, [isImageRoute]);
 
-  const handleLogout = async () => {
-    // Multi-tenant model (§4.6): session lifecycle is owned by the mother
-    // system. "Logout" asks the parent to re-issue an entry ticket rather than
-    // clearing a locally-stored bearer (which no longer exists).
-    requestReauth();
+  const handleReturnToConsole = () => {
+    // The mother system is a same-origin full-page app (image-studio is reverse
+    // -proxied under /image-studio/*), so returning to the console is a plain
+    // top-level navigation to its root dashboard.
+    requestReturnToConsole();
   };
 
   if (pathname === "/login" || pathname === "/login.html" || pathname.startsWith("/login/")) {
@@ -312,9 +321,11 @@ export function TopNav() {
               <button
                 type="button"
                 className="inline-flex h-10 shrink-0 items-center justify-center rounded-2xl border border-stone-200 bg-white px-3 text-sm font-medium text-stone-700 transition hover:bg-stone-50 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:hover:bg-[var(--studio-panel-muted)]"
-                onClick={() => void handleLogout()}
+                onClick={() => handleReturnToConsole()}
+                title="返回控制台"
+                aria-label="返回控制台"
               >
-                <LogOut className="size-4" />
+                <LayoutDashboard className="size-4" />
               </button>
             </div>
           </div>
@@ -406,9 +417,11 @@ export function TopNav() {
               <button
                 type="button"
                 className="inline-flex h-10 shrink-0 items-center justify-center rounded-2xl border border-stone-200 bg-white px-3 text-sm font-medium text-stone-700 transition hover:bg-stone-50 dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] dark:hover:bg-[var(--studio-panel-muted)]"
-                onClick={() => void handleLogout()}
+                onClick={() => handleReturnToConsole()}
+                title="返回控制台"
+                aria-label="返回控制台"
               >
-                <LogOut className="size-4" />
+                <LayoutDashboard className="size-4" />
               </button>
             </div>
             <nav className="hide-scrollbar mt-3 -mx-1 overflow-x-auto px-1">
@@ -442,7 +455,7 @@ export function TopNav() {
         pathname={pathname}
         defaultCollapsed={isImageRoute}
         versionLabel={versionLabel}
-        onLogout={handleLogout}
+        onReturnToConsole={handleReturnToConsole}
       />
     </>
   );

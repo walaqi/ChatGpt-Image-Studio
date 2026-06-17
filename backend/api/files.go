@@ -145,7 +145,15 @@ func (s *Server) searchImageFilePathFallback(name string) string {
 
 // handleImageFile serves cached and server-stored images from storage.image_dir.
 func (s *Server) handleImageFile(w http.ResponseWriter, r *http.Request) {
-	raw := strings.TrimPrefix(r.URL.Path, "/v1/files/image/")
+	// The browser-facing URL carries PublicBasePath (e.g. /image-studio) because
+	// image URLs are built with it baked in. In production a reverse proxy strips
+	// that prefix before the request reaches us; in direct dev access it does not,
+	// so trim it here too so both forms resolve.
+	urlPath := r.URL.Path
+	if base := s.cfg.PublicBasePath(); base != "" {
+		urlPath = strings.TrimPrefix(urlPath, base)
+	}
+	raw := strings.TrimPrefix(urlPath, "/v1/files/image/")
 	if raw == "" {
 		writeError(w, http.StatusNotFound, "image not found")
 		return

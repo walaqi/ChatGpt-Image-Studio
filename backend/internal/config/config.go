@@ -85,6 +85,15 @@ type CPAConfig struct {
 	APIKey         string `toml:"api_key"`
 	RequestTimeout int    `toml:"request_timeout"`
 	RouteStrategy  string `toml:"route_strategy"`
+	// ResponsesContextMaxTurns bounds how many prior conversation turns are
+	// replayed as multi-turn context into a /v1/responses request. 0 disables
+	// context (single-turn). Defaults to 5.
+	ResponsesContextMaxTurns int `toml:"responses_context_max_turns"`
+	// ResponsesContextMaxBytes caps the approximate JSON byte size of the
+	// rebuilt input array (prompts + inlined images). When the most-recent
+	// allowed turns exceed this, the OLDEST turns are dropped first. Defaults to
+	// 8 MiB.
+	ResponsesContextMaxBytes int `toml:"responses_context_max_bytes"`
 }
 
 // IdentityConfig governs multi-tenant entry-ticket verification and the
@@ -511,6 +520,31 @@ func (c *Config) CPAImageRouteStrategy() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return normalizeCPAImageRouteStrategy(c.CPA.RouteStrategy)
+}
+
+// CPAResponsesContextMaxTurns returns how many prior turns to replay as
+// multi-turn context. A negative value disables context; 0 means "use default".
+func (c *Config) CPAResponsesContextMaxTurns() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.CPA.ResponsesContextMaxTurns < 0 {
+		return 0
+	}
+	if c.CPA.ResponsesContextMaxTurns == 0 {
+		return 5
+	}
+	return c.CPA.ResponsesContextMaxTurns
+}
+
+// CPAResponsesContextMaxBytes returns the approximate byte budget for the
+// rebuilt input array. Defaults to 8 MiB.
+func (c *Config) CPAResponsesContextMaxBytes() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.CPA.ResponsesContextMaxBytes > 0 {
+		return c.CPA.ResponsesContextMaxBytes
+	}
+	return 8 << 20
 }
 
 func (c *Config) ImageQueueConfig() (int, int, time.Duration) {

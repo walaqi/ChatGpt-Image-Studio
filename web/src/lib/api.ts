@@ -14,6 +14,8 @@ export type ImageResponseItem = {
   parent_message_id?: string;
   source_account_id?: string;
   error?: string;
+  status?: string;
+  assistant_text?: string;
 };
 
 export type ImageTaskStatus =
@@ -140,7 +142,16 @@ export async function exchangeEntryTicket(ticket: string) {
 }
 
 export async function fetchCredentialKeys() {
-  return httpRequest<CredentialKeyListResult>("/api/image/credential/keys");
+  const result = await httpRequest<CredentialKeyListResult>(
+    "/api/image/credential/keys",
+  );
+  // The backend's keys field is a Go slice that marshals to JSON null when the
+  // mother system returns no candidates. Coerce to an array here so every
+  // consumer can call .find()/.length/.map() without a null guard.
+  return {
+    ...result,
+    keys: Array.isArray(result.keys) ? result.keys : [],
+  };
 }
 
 export async function fetchCurrentCredential() {

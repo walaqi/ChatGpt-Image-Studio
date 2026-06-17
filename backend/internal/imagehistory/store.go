@@ -46,6 +46,11 @@ type Image struct {
 	ParentMessageID string `json:"parent_message_id,omitempty"`
 	SourceAccountID string `json:"source_account_id,omitempty"`
 	Error           string `json:"error,omitempty"`
+	// AssistantText is the model's textual reply for this turn (Responses route).
+	// On the /v1/responses path an image request may produce text alongside an
+	// image, or text only (e.g. a content refusal proposing an alternative). A
+	// text-only turn carries Status "text" with no image bytes.
+	AssistantText string `json:"assistant_text,omitempty"`
 }
 
 type Turn struct {

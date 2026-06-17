@@ -65,12 +65,13 @@ func (r *cpaCallRecorder) calls() int {
 
 // cpaStubWorkflowClient is a route-aware stub CPA image client.
 type cpaStubWorkflowClient struct {
-	route       string
-	model       string
-	recorder    *cpaCallRecorder
-	generateErr error
-	editErr     error
-	inpaintErr  error
+	route         string
+	model         string
+	assistantText string
+	recorder      *cpaCallRecorder
+	generateErr   error
+	editErr       error
+	inpaintErr    error
 }
 
 func (c *cpaStubWorkflowClient) DownloadBytes(url string) ([]byte, error) {
@@ -133,8 +134,9 @@ func (c *cpaStubWorkflowClient) InpaintImageByMask(ctx context.Context, prompt s
 	return []handler.ImageResult{{URL: "stub://inpaint", RevisedPrompt: "stub"}}, nil
 }
 
-func (c *cpaStubWorkflowClient) LastRoute() string      { return c.route }
-func (c *cpaStubWorkflowClient) LastModelLabel() string { return c.model }
+func (c *cpaStubWorkflowClient) LastRoute() string         { return c.route }
+func (c *cpaStubWorkflowClient) LastModelLabel() string    { return c.model }
+func (c *cpaStubWorkflowClient) LastAssistantText() string { return c.assistantText }
 
 // alwaysResolver is a permissive credential.Resolver for the cpa harness: every
 // (userID, keyID) resolves to the same stub-backed credential. Phase 7 removed
@@ -333,8 +335,9 @@ func (c *parallelGenerateWorkflowClient) InpaintImageByMask(ctx context.Context,
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (c *parallelGenerateWorkflowClient) LastRoute() string      { return "images_api" }
-func (c *parallelGenerateWorkflowClient) LastModelLabel() string { return "" }
+func (c *parallelGenerateWorkflowClient) LastRoute() string         { return "images_api" }
+func (c *parallelGenerateWorkflowClient) LastModelLabel() string    { return "" }
+func (c *parallelGenerateWorkflowClient) LastAssistantText() string { return "" }
 
 // useParallelCPAClient swaps in a parallelGenerateWorkflowClient as the server's
 // CPA client factory, returning shared active/maxActive counters.

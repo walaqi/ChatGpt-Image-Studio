@@ -33,18 +33,26 @@ func (e *imageTaskDeferredError) Unwrap() error {
 	return e.cause
 }
 
-func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIndex int, lease *imageTaskLease) ([]imagehistory.Image, error) {
+func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIndex int, lease *imageTaskLease) ([]imagehistory.Image, string, error) {
 	if lease == nil {
-		return nil, fmt.Errorf("task lease is required")
+		return nil, "", fmt.Errorf("task lease is required")
 	}
 	task := s.imageTasks.copyTask(taskID)
 	if task == nil {
-		return nil, fmt.Errorf("task not found")
+		return nil, "", fmt.Errorf("task not found")
 	}
 
 	fakeReq := httptest.NewRequest("POST", "http://"+imageTaskFakeHost+"/api/image/tasks", nil).WithContext(ctx)
 	metadata := newImageRequestMetadata(task.Prompt, task.Size, task.Quality)
 	requestedModel := normalizeRequestedImageModel(task.Model, s.cfg.ChatGPT.Model)
+
+	// Replay prior conversation turns as multi-turn context into the /v1/responses
+	// request (chronological order; pruned to the configured turn/byte budgets).
+	// Only built when the responses route is active; degrades to no context on
+	// any read failure. The current turn is excluded inside the builder.
+	if s.responsesContextEnabled() {
+		ctx = withResponsesContext(ctx, s.buildResponsesContextTurns(ctx, task))
+	}
 
 	// Build the operation once; the runner closure executes against the
 	// per-user CPA credential.
@@ -58,10 +66,10 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 	case task.SourceReference != nil:
 		mask, _, err := s.resolveTaskEditInputs(task)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if len(mask) == 0 {
-			return nil, fmt.Errorf("selection edit mask is required")
+			return nil, "", fmt.Errorf("selection edit mask is required")
 		}
 		operation = "selection-edit"
 		preferredAccount = true
@@ -82,7 +90,7 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 	case task.Mode == "edit" || len(task.SourceImages) > 0:
 		mask, imageFiles, err := s.resolveTaskEditInputs(task)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		operation = "edit"
 		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
@@ -99,11 +107,11 @@ func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIn
 	// into ctx (§8 item 3 — never a shared/account-pool fallback). Admission is
 	// skipped because the task manager already bounds concurrency via
 	// runningUnits.
-	items, err := s.runPureCPAImageRequest(ctx, operation, task.ResponseFormat, requestedModel, preferredAccount, metadata, run, fakeReq, false)
+	items, assistantText, err := s.runPureCPAImageRequest(ctx, operation, task.ResponseFormat, requestedModel, preferredAccount, metadata, run, fakeReq, false)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return historyImagesFromResponseItems(items), nil
+	return historyImagesFromResponseItems(items), assistantText, nil
 }
 
 func historyImagesFromResponseItems(items []map[string]any) []imagehistory.Image {

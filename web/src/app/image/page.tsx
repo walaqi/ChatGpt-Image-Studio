@@ -258,11 +258,15 @@ function mapTaskImagesToStoredImages(images: ImageTaskView["images"]): StoredIma
   return images.map((image, index) => ({
     id: image.file_id || image.gen_id || `task-image-${index}`,
     status:
-      image.error && !image.b64_json && !image.url
-        ? "error"
-        : image.b64_json || image.url
-          ? "success"
-          : "loading",
+      image.status === "text"
+        ? "text"
+        : image.error && !image.b64_json && !image.url
+          ? "error"
+          : image.b64_json || image.url
+            ? "success"
+            : image.assistant_text
+              ? "text"
+              : "loading",
     b64_json: image.b64_json,
     url: image.url,
     revised_prompt: image.revised_prompt,
@@ -272,6 +276,7 @@ function mapTaskImagesToStoredImages(images: ImageTaskView["images"]): StoredIma
     parent_message_id: image.parent_message_id,
     source_account_id: image.source_account_id,
     error: image.error,
+    assistant_text: image.assistant_text,
   }));
 }
 
@@ -350,7 +355,13 @@ function deriveTurnStatusFromImages(
   if (images.some((image) => image.status === "error")) {
     return "error";
   }
-  if (images.length > 0 && images.every((image) => image.status === "success")) {
+  // A text-only reply (model returned text but no image) is a successful turn.
+  if (
+    images.length > 0 &&
+    images.every(
+      (image) => image.status === "success" || image.status === "text",
+    )
+  ) {
     return "success";
   }
   return mapTaskStatusToTurnStatus(taskStatus);

@@ -170,6 +170,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/responses", s.requireImageAuth(http.HandlerFunc(s.handleImageResponses)))
 	mux.Handle("GET /v1/models", s.requireImageAuth(http.HandlerFunc(s.handleModels)))
 	mux.Handle("GET /v1/files/image/", s.requireImageAuth(http.HandlerFunc(s.handleImageFile)))
+	// Image URLs are built with PublicBasePath baked in (e.g.
+	// /image-studio/v1/files/image/...), because in production the browser reaches
+	// this backend through a reverse proxy mounted at that sub-path. In direct dev
+	// access there is no proxy to strip the prefix, so the prefixed path would fall
+	// through to the SPA catch-all and 404. Register the prefixed route too so the
+	// same image URL resolves whether or not a stripping proxy sits in front.
+	if base := s.cfg.PublicBasePath(); base != "" {
+		mux.Handle("GET "+base+"/v1/files/image/", s.requireImageAuth(http.HandlerFunc(s.handleImageFile)))
+	}
 
 	mux.Handle("/", http.HandlerFunc(s.handleWebApp))
 
@@ -477,7 +486,7 @@ func (s *Server) runPureCPAImageRequest(
 	run func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error),
 	r *http.Request,
 	useAdmission bool,
-) ([]map[string]any, error) {
+) ([]map[string]any, string, error) {
 	startedAt := time.Now()
 	cred, credErr := s.resolveImageCredential(ctx)
 	if credErr != nil {
@@ -500,7 +509,7 @@ func (s *Server) runPureCPAImageRequest(
 		}
 		metadata.applyTo(&entry)
 		s.logImageRequest(entry)
-		return nil, credErr
+		return nil, "", credErr
 	}
 
 	if useAdmission {
@@ -533,7 +542,7 @@ func (s *Server) runPureCPAImageRequest(
 			}
 			metadata.applyTo(&entry)
 			s.logImageRequest(entry)
-			return nil, err
+			return nil, "", err
 		}
 		defer releaseAdmission()
 		ctx = withImageAdmissionInfo(ctx, admissionInfo)
@@ -570,7 +579,15 @@ func (s *Server) runPureCPAImageRequest(
 		}
 		metadata.applyTo(&entry)
 		s.logImageRequest(entry)
-		return nil, err
+		return nil, "", err
+	}
+
+	// The Responses route may answer with text only (e.g. a content refusal that
+	// proposes an alternative). That is a successful, non-error outcome: zero
+	// images plus the model's reply, which the caller surfaces to the user.
+	assistantText := ""
+	if texter, ok := client.(interface{ LastAssistantText() string }); ok {
+		assistantText = strings.TrimSpace(texter.LastAssistantText())
 	}
 
 	admissionInfo := imageAdmissionFromContext(ctx)
@@ -593,7 +610,7 @@ func (s *Server) runPureCPAImageRequest(
 	metadata.applyTo(&entry)
 	s.logImageRequest(entry)
 	cpaUserID, _ := identity.UserIDFromContext(ctx)
-	return buildImageResponse(r, client, results, responseFormat, "", cpaUserID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir), s.cfg.PublicBasePath()), nil
+	return buildImageResponse(r, client, results, responseFormat, "", cpaUserID, s.cfg.ResolvePath(s.cfg.Storage.ImageDir), s.cfg.PublicBasePath()), assistantText, nil
 }
 
 

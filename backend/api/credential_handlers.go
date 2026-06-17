@@ -38,8 +38,15 @@ func (s *Server) handleListCredentialKeys(w http.ResponseWriter, r *http.Request
 	// Echo the currently remembered selection so the UI can pre-highlight it.
 	currentKeyID, hasCurrent, _ := s.credService.Selection().Get(r.Context(), userID)
 
+	// Never marshal keys as JSON null: a nil slice would make the frontend's
+	// result.keys.find()/.length crash. Always emit an array.
+	keys := result.Keys
+	if keys == nil {
+		keys = []credential.KeyCandidate{}
+	}
+
 	payload := map[string]any{
-		"keys":           result.Keys,
+		"keys":           keys,
 		"can_create":     result.CanCreate,
 		"image_group_id": result.ImageGroupID,
 	}

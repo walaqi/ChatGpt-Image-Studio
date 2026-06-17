@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -94,6 +95,45 @@ func NewHTTPResolver(cfg HTTPResolverConfig) (*HTTPResolver, error) {
 	}, nil
 }
 
+// decodeEnvelope decodes an internal-credential response into out, transparently
+// unwrapping the mother system's standard response envelope. The mother wraps
+// every payload as {"code":0,"message":"success","data":{...}} (response.Success),
+// but the legacy/standalone contract (and our tests) used a BARE object. To work
+// with both, we read the whole body, peek for a top-level "data" field, and:
+//   - envelope present → require code==0 (non-zero = mother-side error), then
+//     decode the "data" object into out;
+//   - no "data" field → decode the bare body into out (backward-compatible).
+//
+// This guards against the silent-zero-value trap: decoding an envelope straight
+// into a bare struct matches no fields and yields an all-zero result (empty
+// keys + can_create=false, or empty api_key), which previously surfaced as a
+// bogus "image feature not enabled" / ErrKeyUnusable.
+func decodeEnvelope(body io.Reader, out any) error {
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Code    *int            `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && envelope.Data != nil {
+		// Wrapped response. A non-zero code means the mother system reported an
+		// application-level error even though the HTTP status was 2xx.
+		if envelope.Code != nil && *envelope.Code != 0 {
+			msg := strings.TrimSpace(envelope.Message)
+			if msg == "" {
+				msg = "unknown error"
+			}
+			return fmt.Errorf("mother system returned code %d: %s", *envelope.Code, msg)
+		}
+		return json.Unmarshal(envelope.Data, out)
+	}
+	// Bare object (no envelope): decode directly.
+	return json.Unmarshal(raw, out)
+}
+
 // ListKeys implements Resolver (stage 1).
 func (r *HTTPResolver) ListKeys(ctx context.Context, userID string) (KeyListResult, error) {
 	userID = strings.TrimSpace(userID)
@@ -118,7 +158,7 @@ func (r *HTTPResolver) ListKeys(ctx context.Context, userID string) (KeyListResu
 	}
 
 	var result KeyListResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeEnvelope(resp.Body, &result); err != nil {
 		return KeyListResult{}, fmt.Errorf("%w: decode list response: %v", ErrUpstreamUnavailable, err)
 	}
 	return result, nil
@@ -159,7 +199,7 @@ func (r *HTTPResolver) Resolve(ctx context.Context, userID string, keyID int64) 
 	}
 
 	var cred Credential
-	if err := json.NewDecoder(resp.Body).Decode(&cred); err != nil {
+	if err := decodeEnvelope(resp.Body, &cred); err != nil {
 		return Credential{}, fmt.Errorf("%w: decode resolve response: %v", ErrUpstreamUnavailable, err)
 	}
 	// image-studio's configured gateway URL wins over the mother's base_url so

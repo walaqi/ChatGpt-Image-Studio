@@ -9,7 +9,15 @@ import webConfig from "@/constants/common-env";
 // rides along with every same-origin request automatically.
 //
 // The legacy single-tenant bearer-key flow is gone; the backend still accepts
-// it for dev/compat, but the embedded frontend always uses cookies.
+// it for dev/compat, but image-studio always uses cookies.
+//
+// Deployment shape: image-studio runs as a SAME-ORIGIN, FULL-PAGE app reverse-
+// proxied under the mother system's /image-studio/* prefix (NOT a cross-origin
+// iframe). The mother system enters via a full-page navigation, so window.top
+// is image-studio itself — there is no parent window to postMessage. The
+// requestReauth / requestCreateCredential / requestReturnToConsole helpers below
+// therefore navigate the whole page to mother-system routes at the site ROOT
+// (outside the /image-studio prefix), using absolute root paths.
 
 const TICKET_QUERY_PARAM = "ticket";
 
@@ -77,34 +85,54 @@ export async function exchangeTicketForSession(ticket: string): Promise<boolean>
   return response.ok;
 }
 
-// requestReauth asks the parent (mother system) window to re-issue an entry
-// ticket. Used when the session cookie has expired (401). When not embedded,
-// there is nothing we can do but surface the state to the caller.
+// requestReauth re-establishes the session after it expires (a 401). image-
+// studio cannot mint its own entry ticket — only the mother system can — so it
+// navigates the whole page to the mother system's image-studio transit route.
+// That Vue route mints a fresh one-time ticket and redirects back to
+// /image-studio/?ticket=<jwt>, closing the re-authorization loop.
+//
+// This is a SAME-ORIGIN FULL-PAGE app (NOT an iframe embed): window.top is
+// image-studio itself, so there is no parent window to postMessage. The target
+// is a mother-system route at the site ROOT, OUTSIDE the /image-studio/* reverse
+// -proxy prefix, so it must be an absolute root path — never built from
+// webConfig.apiUrl (which carries the /image-studio prefix).
+const REAUTH_PATH = "/image-studio";
+
 export function requestReauth(): void {
   if (typeof window === "undefined") {
     return;
   }
-  if (window.parent && window.parent !== window) {
-    // The mother system listens for this and re-navigates the iframe with a
-    // fresh ?ticket=. Origin is "*" here because the parent validates on its
-    // side; we never send sensitive data in this message.
-    window.parent.postMessage({ type: "image-studio:reauth" }, "*");
-  }
+  window.location.assign(REAUTH_PATH);
 }
 
-// requestCreateCredential asks the parent (mother system) window to take the
-// user to its key-creation flow under the preset image group. Used by the
-// credential picker when the user has no usable image key yet
-// (docs/multi-tenant-redesign.md §4.6). The mother system owns the actual
-// create-key UI; image-studio only signals intent and the target group.
-export function requestCreateCredential(imageGroupId: number | null): void {
+// CONSOLE_PATH is the mother system's console/dashboard, served at the site root
+// (image-studio is reverse-proxied under /image-studio/* on the same origin).
+const CONSOLE_PATH = "/dashboard";
+
+// requestReturnToConsole navigates the whole page back to the mother system's
+// console. The mother system is a same-origin full-page app (NOT an iframe
+// embed), so this is a plain top-level navigation rather than a postMessage.
+export function requestReturnToConsole(): void {
   if (typeof window === "undefined") {
     return;
   }
-  if (window.parent && window.parent !== window) {
-    window.parent.postMessage(
-      { type: "image-studio:create-credential", imageGroupId },
-      "*",
-    );
+  window.location.assign(CONSOLE_PATH);
+}
+
+// requestCreateCredential takes the user to the mother system's key-creation
+// page so they can create an image-capable channel key. Used by the credential
+// picker when the user has no usable image key yet
+// (docs/multi-tenant-redesign.md §4.6). The mother system owns the create-key
+// UI; image-studio only navigates there.
+//
+// Same as requestReauth: full-page navigation (no iframe parent), and the target
+// is a mother-system route at the site ROOT, outside the /image-studio/* prefix,
+// so it must be an absolute root path — never built from webConfig.apiUrl.
+const CREATE_KEY_PATH = "/keys";
+
+export function requestCreateCredential(_imageGroupId: number | null): void {
+  if (typeof window === "undefined") {
+    return;
   }
+  window.location.assign(CREATE_KEY_PATH);
 }
