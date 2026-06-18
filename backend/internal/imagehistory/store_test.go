@@ -2,6 +2,7 @@ package imagehistory
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 
 	"chatgpt2api/internal/config"
 )
+
+const testHistoryUser = "u1"
 
 func newHistoryTestConfig(t *testing.T, backend string) *config.Config {
 	t.Helper()
@@ -41,7 +44,7 @@ func testStorePersistenceAcrossReload(t *testing.T, backend string) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("persist-image-bytes"))
-	if _, err := store.Save(context.Background(), Conversation{
+	if _, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "persist-conv",
 		Title:     "生成",
 		Mode:      "generate",
@@ -71,14 +74,14 @@ func testStorePersistenceAcrossReload(t *testing.T, backend string) {
 	}
 	defer reloaded.Close()
 
-	items, err := reloaded.List(context.Background())
+	items, err := reloaded.List(context.Background(), testHistoryUser)
 	if err != nil {
 		t.Fatalf("List(%s): %v", backend, err)
 	}
 	if len(items) != 1 || items[0].ID != "persist-conv" {
 		t.Fatalf("reloaded items(%s) = %#v", backend, items)
 	}
-	if got := items[0].Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/result-") {
+	if got := items[0].Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/result-") {
 		t.Fatalf("reloaded image url(%s) = %q", backend, got)
 	}
 }
@@ -99,7 +102,7 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("image-bytes"))
-	created, err := store.Save(context.Background(), Conversation{
+	created, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-1",
 		Title:     "生成",
 		Mode:      "generate",
@@ -133,17 +136,17 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 	if got := created.Turns[0].Images[0].B64JSON; got != "" {
 		t.Fatalf("B64JSON should be stripped from stored history, got %q", got)
 	}
-	if got := created.Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/result-") {
+	if got := created.Turns[0].Images[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/result-") {
 		t.Fatalf("stored result URL = %q", got)
 	}
 	if got := created.Turns[0].SourceImages[0].DataURL; got != "" {
 		t.Fatalf("DataURL should be stripped from stored source, got %q", got)
 	}
-	if got := created.Turns[0].SourceImages[0].URL; !strings.HasPrefix(got, "/v1/files/image/source-") {
+	if got := created.Turns[0].SourceImages[0].URL; !strings.HasPrefix(got, "/v1/files/image/u1/source-") {
 		t.Fatalf("stored source URL = %q", got)
 	}
 
-	matches, err := filepath.Glob(filepath.Join(root, "data", "images", "*.png"))
+	matches, err := filepath.Glob(filepath.Join(root, "data", "images", testHistoryUser, "*.png"))
 	if err != nil {
 		t.Fatalf("glob image dir: %v", err)
 	}
@@ -156,7 +159,7 @@ func TestFileStoreExtractsImagesToServerDirectory(t *testing.T) {
 		}
 	}
 
-	items, err := store.List(context.Background())
+	items, err := store.List(context.Background(), testHistoryUser)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -181,7 +184,7 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 	defer store.Close()
 
 	payload := base64.StdEncoding.EncodeToString([]byte("shared-image-bytes"))
-	first, err := store.Save(context.Background(), Conversation{
+	first, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-1",
 		Title:     "生成",
 		Mode:      "generate",
@@ -205,7 +208,7 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Save first conversation: %v", err)
 	}
-	second, err := store.Save(context.Background(), Conversation{
+	second, err := store.Save(context.Background(), testHistoryUser, Conversation{
 		ID:        "conv-2",
 		Title:     "生成",
 		Mode:      "generate",
@@ -239,18 +242,116 @@ func TestDeleteOnlyRemovesUnreferencedImageFiles(t *testing.T) {
 		t.Fatalf("expected shared image file to exist: %v", err)
 	}
 
-	if err := store.Delete(context.Background(), "conv-1"); err != nil {
+	if err := store.Delete(context.Background(), testHistoryUser, "conv-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := os.Stat(sharedPath); err != nil {
 		t.Fatalf("shared image should still exist after deleting one conversation: %v", err)
 	}
 
-	if err := store.Delete(context.Background(), "conv-2"); err != nil {
+	if err := store.Delete(context.Background(), testHistoryUser, "conv-2"); err != nil {
 		t.Fatalf("Delete second: %v", err)
 	}
 	if _, err := os.Stat(sharedPath); !os.IsNotExist(err) {
 		t.Fatalf("shared image should be removed after deleting last reference, err=%v", err)
+	}
+}
+
+// TestCleanupTouchesOnlyOwnUserDir is the §8 item-6 regression: when two users
+// store the same image bytes, deleting/clearing one user's history must remove
+// only that user's copy from its own subdir, never touch the other user's file.
+// Per-user subdirs mean identical bytes hash to the same filename but live in
+// separate directories, so cleanup must be scoped by userID.
+func TestCleanupTouchesOnlyOwnUserDir(t *testing.T) {
+	const (
+		userA = "alice"
+		userB = "bob"
+	)
+	root := t.TempDir()
+	cfg := config.New(root)
+	if err := cfg.Load(); err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.Storage.Backend = "current"
+	cfg.Storage.ImageDir = "data/images"
+
+	store, err := NewStore(cfg)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+
+	// Identical bytes for both users → same content hash, different subdirs.
+	payload := base64.StdEncoding.EncodeToString([]byte("shared-across-tenants"))
+	saveFor := func(userID, convID string) *Conversation {
+		t.Helper()
+		saved, err := store.Save(context.Background(), userID, Conversation{
+			ID:        convID,
+			Title:     "生成",
+			Mode:      "generate",
+			Prompt:    "x",
+			Model:     "gpt-image-2",
+			Count:     1,
+			CreatedAt: "2026-04-26T00:00:00Z",
+			Status:    "success",
+			Turns: []Turn{{
+				ID:        convID + "-turn",
+				Title:     "生成",
+				Mode:      "generate",
+				Prompt:    "x",
+				Model:     "gpt-image-2",
+				Count:     1,
+				CreatedAt: "2026-04-26T00:00:00Z",
+				Status:    "success",
+				Images:    []Image{{ID: convID + "-img", Status: "success", B64JSON: payload}},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Save(%s): %v", userID, err)
+		}
+		return saved
+	}
+
+	aConv := saveFor(userA, "conv-a")
+	bConv := saveFor(userB, "conv-b")
+
+	aFile := filenameFromImageURL(aConv.Turns[0].Images[0].URL)
+	bFile := filenameFromImageURL(bConv.Turns[0].Images[0].URL)
+	if aFile == "" || bFile == "" {
+		t.Fatalf("missing image filenames: a=%q b=%q", aFile, bFile)
+	}
+	// Dedup is content-addressed, so the basenames match; isolation comes from
+	// the per-user subdir, not the filename.
+	if aFile != bFile {
+		t.Fatalf("expected identical content-addressed basenames, got a=%q b=%q", aFile, bFile)
+	}
+
+	aPath := filepath.Join(root, "data", "images", userA, aFile)
+	bPath := filepath.Join(root, "data", "images", userB, bFile)
+	if _, err := os.Stat(aPath); err != nil {
+		t.Fatalf("userA image should exist: %v", err)
+	}
+	if _, err := os.Stat(bPath); err != nil {
+		t.Fatalf("userB image should exist: %v", err)
+	}
+
+	// Deleting userA's conversation must remove only userA's file.
+	if err := store.Delete(context.Background(), userA, "conv-a"); err != nil {
+		t.Fatalf("Delete userA: %v", err)
+	}
+	if _, err := os.Stat(aPath); !os.IsNotExist(err) {
+		t.Fatalf("userA image should be gone after delete, err=%v", err)
+	}
+	if _, err := os.Stat(bPath); err != nil {
+		t.Fatalf("userB image must survive userA's delete: %v", err)
+	}
+
+	// Clearing userB must not error and must remove only userB's file.
+	if err := store.Clear(context.Background(), userB); err != nil {
+		t.Fatalf("Clear userB: %v", err)
+	}
+	if _, err := os.Stat(bPath); !os.IsNotExist(err) {
+		t.Fatalf("userB image should be gone after clear, err=%v", err)
 	}
 }
 
@@ -260,4 +361,52 @@ func TestSQLiteStorePersistsImageHistoryAcrossReload(t *testing.T) {
 
 func TestRedisStorePersistsImageHistoryAcrossReload(t *testing.T) {
 	testStorePersistenceAcrossReload(t, "redis")
+}
+
+// TestSQLiteMigrationPurgesLegacyRows proves the §5 DB migration: when an old
+// single-tenant database (no user_id column) is opened, the migration adds the
+// column + index and DELETEs the legacy ownerless rows rather than silently
+// assigning them an empty user_id (per the multi-tenant cutover decision).
+func TestSQLiteMigrationPurgesLegacyRows(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "legacy-history.sqlite")
+
+	// Build a pre-migration database: original schema, one ownerless row.
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE image_conversations (id TEXT PRIMARY KEY, raw_json BLOB NOT NULL, updated_at TEXT NOT NULL);`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO image_conversations(id, raw_json, updated_at) VALUES(?, ?, ?)`,
+		"legacy-conv", []byte(`{"id":"legacy-conv"}`), "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	// Opening through the backend runs the migration.
+	backend := &sqliteBackend{path: dbPath}
+	if err := backend.Init(); err != nil {
+		t.Fatalf("Init (migration): %v", err)
+	}
+	defer backend.db.Close()
+
+	hasColumn, err := backend.columnExists("image_conversations", "user_id")
+	if err != nil {
+		t.Fatalf("columnExists: %v", err)
+	}
+	if !hasColumn {
+		t.Fatal("user_id column should exist after migration")
+	}
+
+	var count int
+	if err := backend.db.QueryRow(`SELECT COUNT(*) FROM image_conversations`).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("legacy ownerless rows = %d, want 0 (purged by migration)", count)
+	}
 }

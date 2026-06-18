@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"chatgpt2api/internal/config"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/imagehistory"
 )
 
@@ -21,7 +21,12 @@ func (s *Server) handleListImageConversations(w http.ResponseWriter, r *http.Req
 	}
 	defer store.Close()
 
-	items, err := store.List(r.Context())
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
+	items, err := store.List(r.Context(), userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -41,7 +46,12 @@ func (s *Server) handleGetImageConversation(w http.ResponseWriter, r *http.Reque
 	}
 	defer store.Close()
 
-	item, err := store.Get(r.Context(), r.PathValue("id"))
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
+	item, err := store.Get(r.Context(), userID, r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -67,6 +77,12 @@ func (s *Server) handleSaveImageConversation(w http.ResponseWriter, r *http.Requ
 		body.ID = pathID
 	}
 
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
+
 	store, err := imagehistory.NewStore(s.cfg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -74,7 +90,7 @@ func (s *Server) handleSaveImageConversation(w http.ResponseWriter, r *http.Requ
 	}
 	defer store.Close()
 
-	item, err := store.Save(r.Context(), body)
+	item, err := store.Save(r.Context(), userID, body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -87,6 +103,12 @@ func (s *Server) handleDeleteImageConversation(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "server image storage is disabled"})
 		return
 	}
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
+
 	store, err := imagehistory.NewStore(s.cfg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -94,7 +116,7 @@ func (s *Server) handleDeleteImageConversation(w http.ResponseWriter, r *http.Re
 	}
 	defer store.Close()
 
-	if err := store.Delete(r.Context(), r.PathValue("id")); err != nil {
+	if err := store.Delete(r.Context(), userID, r.PathValue("id")); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -106,6 +128,12 @@ func (s *Server) handleClearImageConversations(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "server image storage is disabled"})
 		return
 	}
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
+
 	store, err := imagehistory.NewStore(s.cfg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -113,57 +141,50 @@ func (s *Server) handleClearImageConversations(w http.ResponseWriter, r *http.Re
 	}
 	defer store.Close()
 
-	if err := store.Clear(r.Context()); err != nil {
+	if err := store.Clear(r.Context(), userID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleImportImageConversations imports conversation content for the current
+// user. Per review #4 (docs §4.5) it accepts ONLY conversation items — never
+// storage coordinates (backend/redisAddr/sqlitePath/...). The server's own
+// configured store is always used, and Clear/Save are scoped to the current
+// user, so a tenant can neither point the server at an arbitrary Redis/path nor
+// touch another user's history.
 func (s *Server) handleImportImageConversations(w http.ResponseWriter, r *http.Request) {
+	if !s.serverImageConversationStorageEnabled() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "server image storage is disabled"})
+		return
+	}
+	userID, ok := identity.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthenticated"})
+		return
+	}
 	var body struct {
-		Items   []imagehistory.Conversation `json:"items"`
-		Storage struct {
-			Backend                  string `json:"backend"`
-			ImageDir                 string `json:"imageDir"`
-			SQLitePath               string `json:"sqlitePath"`
-			RedisAddr                string `json:"redisAddr"`
-			RedisPassword            string `json:"redisPassword"`
-			RedisDB                  int    `json:"redisDb"`
-			RedisPrefix              string `json:"redisPrefix"`
-			ImageConversationStorage string `json:"imageConversationStorage"`
-			ImageDataStorage         string `json:"imageDataStorage"`
-		} `json:"storage"`
+		Items []imagehistory.Conversation `json:"items"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
 		return
 	}
 
-	tempCfg := config.New(s.cfg.RootDir())
-	tempCfg.Storage.Backend = body.Storage.Backend
-	tempCfg.Storage.ImageDir = firstNonEmpty(body.Storage.ImageDir, s.cfg.Storage.ImageDir)
-	tempCfg.Storage.SQLitePath = firstNonEmpty(body.Storage.SQLitePath, s.cfg.Storage.SQLitePath)
-	tempCfg.Storage.RedisAddr = firstNonEmpty(body.Storage.RedisAddr, s.cfg.Storage.RedisAddr)
-	tempCfg.Storage.RedisPassword = body.Storage.RedisPassword
-	tempCfg.Storage.RedisDB = body.Storage.RedisDB
-	tempCfg.Storage.RedisPrefix = firstNonEmpty(body.Storage.RedisPrefix, s.cfg.Storage.RedisPrefix)
-	tempCfg.Storage.ImageConversationStorage = firstNonEmpty(body.Storage.ImageConversationStorage, "server")
-	tempCfg.Storage.ImageDataStorage = firstNonEmpty(body.Storage.ImageDataStorage, tempCfg.Storage.ImageConversationStorage)
-
-	store, err := imagehistory.NewStore(tempCfg)
+	store, err := imagehistory.NewStore(s.cfg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	defer store.Close()
 
-	if err := store.Clear(r.Context()); err != nil {
+	if err := store.Clear(r.Context(), userID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	for _, item := range body.Items {
-		if _, err := store.Save(r.Context(), item); err != nil {
+		if _, err := store.Save(r.Context(), userID, item); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}

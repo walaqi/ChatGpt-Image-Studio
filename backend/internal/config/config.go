@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"chatgpt2api/internal/outboundproxy"
 
 	"github.com/BurntSushi/toml"
 )
@@ -41,42 +40,31 @@ type AppConfig struct {
 }
 
 type ServerConfig struct {
-	Host                     string `toml:"host"`
-	Port                     int    `toml:"port"`
-	StaticDir                string `toml:"static_dir"`
-	MaxImageConcurrency      int    `toml:"max_image_concurrency"`
-	ImageQueueLimit          int    `toml:"image_queue_limit"`
-	ImageQueueTimeoutSeconds int    `toml:"image_queue_timeout_seconds"`
-	ImageTaskQueueTTLSeconds int    `toml:"image_task_queue_ttl_seconds"`
+	Host                     string   `toml:"host"`
+	Port                     int      `toml:"port"`
+	StaticDir                string   `toml:"static_dir"`
+	PublicBasePath           string   `toml:"public_base_path"`
+	AllowedOrigins           []string `toml:"allowed_origins"`
+	MaxImageConcurrency      int      `toml:"max_image_concurrency"`
+	ImageQueueLimit          int      `toml:"image_queue_limit"`
+	ImageQueueTimeoutSeconds int      `toml:"image_queue_timeout_seconds"`
+	ImageTaskQueueTTLSeconds int      `toml:"image_task_queue_ttl_seconds"`
 }
 
 type ChatGPTConfig struct {
-	Model                            string `toml:"model"`
-	SSETimeout                       int    `toml:"sse_timeout"`
-	PollInterval                     int    `toml:"poll_interval"`
-	PollMaxWait                      int    `toml:"poll_max_wait"`
-	RequestTimeout                   int    `toml:"request_timeout"`
-	ImageMode                        string `toml:"image_mode"`
-	FreeImageRoute                   string `toml:"free_image_route"`
-	FreeImageModel                   string `toml:"free_image_model"`
-	PaidImageRoute                   string `toml:"paid_image_route"`
-	PaidImageModel                   string `toml:"paid_image_model"`
-	StudioAllowDisabledImageAccounts bool   `toml:"studio_allow_disabled_image_accounts"`
-}
-
-type AccountsConfig struct {
-	DefaultQuota                int  `toml:"default_quota"`
-	PreferRemoteRefresh         bool `toml:"prefer_remote_refresh"`
-	RefreshWorkers              int  `toml:"refresh_workers"`
-	ImageQuotaRefreshTTLSeconds int  `toml:"image_quota_refresh_ttl_seconds"`
+	Model          string `toml:"model"`
+	SSETimeout     int    `toml:"sse_timeout"`
+	PollInterval   int    `toml:"poll_interval"`
+	PollMaxWait    int    `toml:"poll_max_wait"`
+	RequestTimeout int    `toml:"request_timeout"`
+	// ImageMode is retained for forward/backward config compatibility but the
+	// backend is cpa-only since phase 7; any value normalizes to "cpa".
+	ImageMode string `toml:"image_mode"`
 }
 
 type StorageConfig struct {
 	Backend                  string `toml:"backend"`
 	ConfigBackend            string `toml:"config_backend"`
-	AuthDir                  string `toml:"auth_dir"`
-	StateFile                string `toml:"state_file"`
-	SyncStateDir             string `toml:"sync_state_dir"`
 	ImageDir                 string `toml:"image_dir"`
 	ImageStorage             string `toml:"image_storage"`
 	ImageConversationStorage string `toml:"image_conversation_storage"`
@@ -88,24 +76,8 @@ type StorageConfig struct {
 	RedisPrefix              string `toml:"redis_prefix"`
 }
 
-type SyncConfig struct {
-	Enabled        bool   `toml:"enabled"`
-	BaseURL        string `toml:"base_url"`
-	ManagementKey  string `toml:"management_key"`
-	RequestTimeout int    `toml:"request_timeout"`
-	Concurrency    int    `toml:"concurrency"`
-	ProviderType   string `toml:"provider_type"`
-}
-
 type LogConfig struct {
 	LogAllRequests bool `toml:"log_all_requests"`
-}
-
-type ProxyConfig struct {
-	Enabled     bool   `toml:"enabled"`
-	URL         string `toml:"url"`
-	Mode        string `toml:"mode"`
-	SyncEnabled bool   `toml:"sync_enabled"`
 }
 
 type CPAConfig struct {
@@ -113,25 +85,49 @@ type CPAConfig struct {
 	APIKey         string `toml:"api_key"`
 	RequestTimeout int    `toml:"request_timeout"`
 	RouteStrategy  string `toml:"route_strategy"`
+	// ResponsesContextMaxTurns bounds how many prior conversation turns are
+	// replayed as multi-turn context into a /v1/responses request. 0 disables
+	// context (single-turn). Defaults to 5.
+	ResponsesContextMaxTurns int `toml:"responses_context_max_turns"`
+	// ResponsesContextMaxBytes caps the approximate JSON byte size of the
+	// rebuilt input array (prompts + inlined images). When the most-recent
+	// allowed turns exceed this, the OLDEST turns are dropped first. Defaults to
+	// 8 MiB.
+	ResponsesContextMaxBytes int `toml:"responses_context_max_bytes"`
 }
 
-type NewAPIConfig struct {
-	BaseURL        string `toml:"base_url"`
-	Username       string `toml:"username"`
-	Password       string `toml:"password"`
-	AccessToken    string `toml:"access_token"`
-	UserID         int    `toml:"user_id"`
-	SessionCookie  string `toml:"session_cookie"`
-	RequestTimeout int    `toml:"request_timeout"`
+// IdentityConfig governs multi-tenant entry-ticket verification and the
+// image-studio self-issued session cookie. See docs/multi-tenant-redesign.md §4.1.
+type IdentityConfig struct {
+	// JWTPublicKeyPath is the PEM file holding the mother system's RS256 public
+	// key, used to verify entry tickets.
+	JWTPublicKeyPath string `toml:"jwt_public_key_path"`
+	// JWTIssuer / JWTAudience are the expected iss/aud claim values.
+	JWTIssuer   string `toml:"jwt_issuer"`
+	JWTAudience string `toml:"jwt_audience"`
+	// SessionSecret signs image-studio's own session cookie (independent of the
+	// mother system's key).
+	SessionSecret string `toml:"session_secret"`
+	// SessionTTLSeconds bounds the session cookie lifetime.
+	SessionTTLSeconds int `toml:"session_ttl_seconds"`
 }
 
-type Sub2APIConfig struct {
-	BaseURL        string `toml:"base_url"`
-	Email          string `toml:"email"`
-	Password       string `toml:"password"`
-	APIKey         string `toml:"api_key"`
-	GroupID        string `toml:"group_id"`
-	RequestTimeout int    `toml:"request_timeout"`
+// CredentialConfig governs the two-stage callback to the mother system that
+// resolves a user's channel api-key. See docs/multi-tenant-redesign.md §4.2.
+type CredentialConfig struct {
+	// EndpointBase is the mother system's internal base URL. The two-stage
+	// endpoints are <base>/internal/cred/keys and <base>/internal/cred.
+	EndpointBase string `toml:"endpoint_base"`
+	// InternalSecret is the service-to-service shared secret (X-Internal-Secret).
+	InternalSecret string `toml:"internal_secret"`
+	// CacheTTLSeconds bounds how long resolved plaintext credentials are cached.
+	CacheTTLSeconds int `toml:"cache_ttl_seconds"`
+	// GatewayBaseURL is the OpenAI-compatible gateway image-studio calls with the
+	// user's key. Set per environment; takes precedence over any base_url the
+	// mother system returns.
+	GatewayBaseURL string `toml:"gateway_base_url"`
+	// RequestTimeout bounds the internal callback HTTP timeout (seconds).
+	RequestTimeout int `toml:"request_timeout"`
 }
 
 type Config struct {
@@ -140,17 +136,15 @@ type Config struct {
 	loaded bool         `toml:"-"`
 	paths  Paths        `toml:"-"`
 
-	App      AppConfig      `toml:"app"`
-	Server   ServerConfig   `toml:"server"`
-	ChatGPT  ChatGPTConfig  `toml:"chatgpt"`
-	Accounts AccountsConfig `toml:"accounts"`
-	Storage  StorageConfig  `toml:"storage"`
-	Sync     SyncConfig     `toml:"sync"`
-	Log      LogConfig      `toml:"log"`
-	Proxy    ProxyConfig    `toml:"proxy"`
-	CPA      CPAConfig      `toml:"cpa"`
-	NewAPI   NewAPIConfig   `toml:"newapi"`
-	Sub2API  Sub2APIConfig  `toml:"sub2api"`
+	App     AppConfig     `toml:"app"`
+	Server  ServerConfig  `toml:"server"`
+	ChatGPT ChatGPTConfig `toml:"chatgpt"`
+	Storage StorageConfig `toml:"storage"`
+	Log     LogConfig     `toml:"log"`
+	CPA     CPAConfig     `toml:"cpa"`
+
+	Identity   IdentityConfig   `toml:"identity"`
+	Credential CredentialConfig `toml:"credential"`
 }
 
 func New(rootDir string) *Config {
@@ -433,36 +427,74 @@ func (c *Config) copyFrom(other *Config) {
 	c.App = other.App
 	c.Server = other.Server
 	c.ChatGPT = other.ChatGPT
-	c.Accounts = other.Accounts
 	c.Storage = other.Storage
-	c.Sync = other.Sync
 	c.Log = other.Log
-	c.Proxy = other.Proxy
 	c.CPA = other.CPA
-	c.NewAPI = other.NewAPI
-	c.Sub2API = other.Sub2API
+	c.Identity = other.Identity
+	c.Credential = other.Credential
 	c.paths = other.paths
 }
 
-func (c *Config) ChatGPTProxyURL() string {
+// PublicBasePath returns the external sub-path prefix (e.g. "/image-studio")
+// used to build browser-visible image URLs in OpenAI-compatible responses. It
+// is normalized to have a leading slash and no trailing slash; empty means no
+// prefix (local direct-access development).
+func (c *Config) PublicBasePath() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.proxyURLLocked(false)
+	return normalizePublicBasePath(c.Server.PublicBasePath)
 }
 
-func (c *Config) SyncProxyURL() string {
+func normalizePublicBasePath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+// SessionTTL returns the configured session cookie lifetime, defaulting to 1h.
+func (c *Config) SessionTTL() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.proxyURLLocked(true)
+	seconds := c.Identity.SessionTTLSeconds
+	if seconds <= 0 {
+		seconds = 3600
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// CredentialCacheTTL returns how long resolved plaintext credentials are
+// cached, defaulting to 60s.
+func (c *Config) CredentialCacheTTL() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seconds := c.Credential.CacheTTLSeconds
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// CredentialRequestTimeout returns the internal callback HTTP timeout,
+// defaulting to 20s.
+func (c *Config) CredentialRequestTimeout() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seconds := c.Credential.RequestTimeout
+	if seconds <= 0 {
+		seconds = 20
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (c *Config) CPAImageBaseURL() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if trimmed := strings.TrimSpace(c.CPA.BaseURL); trimmed != "" {
-		return trimmed
-	}
-	return strings.TrimSpace(c.Sync.BaseURL)
+	return strings.TrimSpace(c.CPA.BaseURL)
 }
 
 func (c *Config) CPAImageAPIKey() string {
@@ -488,6 +520,31 @@ func (c *Config) CPAImageRouteStrategy() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return normalizeCPAImageRouteStrategy(c.CPA.RouteStrategy)
+}
+
+// CPAResponsesContextMaxTurns returns how many prior turns to replay as
+// multi-turn context. A negative value disables context; 0 means "use default".
+func (c *Config) CPAResponsesContextMaxTurns() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.CPA.ResponsesContextMaxTurns < 0 {
+		return 0
+	}
+	if c.CPA.ResponsesContextMaxTurns == 0 {
+		return 5
+	}
+	return c.CPA.ResponsesContextMaxTurns
+}
+
+// CPAResponsesContextMaxBytes returns the approximate byte budget for the
+// rebuilt input array. Defaults to 8 MiB.
+func (c *Config) CPAResponsesContextMaxBytes() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.CPA.ResponsesContextMaxBytes > 0 {
+		return c.CPA.ResponsesContextMaxBytes
+	}
+	return 8 << 20
 }
 
 func (c *Config) ImageQueueConfig() (int, int, time.Duration) {
@@ -520,30 +577,6 @@ func (c *Config) ImageTaskQueueTTL() time.Duration {
 	return time.Duration(ttlSeconds) * time.Second
 }
 
-func (c *Config) ImageQuotaRefreshTTL() time.Duration {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	ttlSeconds := c.Accounts.ImageQuotaRefreshTTLSeconds
-	if ttlSeconds <= 0 {
-		ttlSeconds = 120
-	}
-	return time.Duration(ttlSeconds) * time.Second
-}
-
-func (c *Config) proxyURLLocked(forSync bool) string {
-	if !c.Proxy.Enabled {
-		return ""
-	}
-	if forSync && !c.Proxy.SyncEnabled {
-		return ""
-	}
-	if normalizeProxyMode(c.Proxy.Mode) != "fixed" {
-		return ""
-	}
-	return strings.TrimSpace(c.Proxy.URL)
-}
-
 func (c *Config) validate() error {
 	if c.Server.MaxImageConcurrency <= 0 {
 		c.Server.MaxImageConcurrency = 8
@@ -557,32 +590,14 @@ func (c *Config) validate() error {
 	if c.Server.ImageTaskQueueTTLSeconds <= 0 {
 		c.Server.ImageTaskQueueTTLSeconds = 600
 	}
-	if c.Accounts.ImageQuotaRefreshTTLSeconds <= 0 {
-		c.Accounts.ImageQuotaRefreshTTLSeconds = 120
-	}
 
-	if normalized, ok := normalizeImageMode(c.ChatGPT.ImageMode); !ok {
-		return fmt.Errorf("invalid chatgpt.image_mode %q: only studio or cpa are supported", strings.TrimSpace(c.ChatGPT.ImageMode))
-	} else {
+	// Phase 7: the backend is cpa-only. ImageMode is still normalized so a
+	// stale studio/mix value in an old config doesn't error on startup.
+	if normalized, ok := normalizeImageMode(c.ChatGPT.ImageMode); ok {
 		c.ChatGPT.ImageMode = normalized
-	}
-
-	if normalized, ok := normalizeImageRoute(c.ChatGPT.FreeImageRoute); !ok {
-		return fmt.Errorf("invalid chatgpt.free_image_route %q: only legacy or responses are supported", strings.TrimSpace(c.ChatGPT.FreeImageRoute))
-	} else if normalized == "" {
-		return fmt.Errorf("invalid chatgpt.free_image_route %q", strings.TrimSpace(c.ChatGPT.FreeImageRoute))
 	} else {
-		c.ChatGPT.FreeImageRoute = normalized
+		c.ChatGPT.ImageMode = "cpa"
 	}
-	if normalized, ok := normalizeImageRoute(c.ChatGPT.PaidImageRoute); !ok {
-		return fmt.Errorf("invalid chatgpt.paid_image_route %q: only legacy or responses are supported", strings.TrimSpace(c.ChatGPT.PaidImageRoute))
-	} else if normalized == "" {
-		return fmt.Errorf("invalid chatgpt.paid_image_route %q", strings.TrimSpace(c.ChatGPT.PaidImageRoute))
-	} else {
-		c.ChatGPT.PaidImageRoute = normalized
-	}
-	c.ChatGPT.FreeImageModel = normalizeConfiguredImageRouteModel(c.ChatGPT.FreeImageRoute, c.ChatGPT.FreeImageModel, "auto", true)
-	c.ChatGPT.PaidImageModel = normalizeConfiguredImageRouteModel(c.ChatGPT.PaidImageRoute, c.ChatGPT.PaidImageModel, "gpt-5.4-mini", false)
 
 	c.CPA.RouteStrategy = normalizeCPAImageRouteStrategy(c.CPA.RouteStrategy)
 	c.Storage.Backend = normalizeStorageBackend(c.Storage.Backend)
@@ -601,68 +616,14 @@ func (c *Config) validate() error {
 	}
 	c.Storage.ImageStorage = c.Storage.ImageConversationStorage
 
-	if !c.Proxy.Enabled {
-		return nil
-	}
-
-	if normalizeProxyMode(c.Proxy.Mode) != "fixed" {
-		return fmt.Errorf("unsupported proxy.mode %q: only fixed is supported", strings.TrimSpace(c.Proxy.Mode))
-	}
-
-	if strings.TrimSpace(c.Proxy.URL) == "" {
-		return fmt.Errorf("proxy.url is required when proxy.enabled = true")
-	}
-
-	if err := outboundproxy.Validate(c.Proxy.URL); err != nil {
-		return fmt.Errorf("invalid proxy.url: %w", err)
-	}
-
 	return nil
 }
 
-func normalizeProxyMode(mode string) string {
-	normalized := strings.ToLower(strings.TrimSpace(mode))
-	if normalized == "" {
-		return "fixed"
-	}
-	return normalized
-}
-
-func normalizeImageRoute(route string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(route)) {
-	case "", "legacy", "conversation":
-		return "legacy", true
-	case "responses":
-		return "responses", true
-	default:
-		return "", false
-	}
-}
-
-func normalizeConfiguredImageRouteModel(route, value, fallback string, allowAuto bool) string {
-	model := strings.ToLower(strings.TrimSpace(value))
-	if model == "" {
-		return fallback
-	}
-	if allowAuto && model == "auto" {
-		return "auto"
-	}
-	switch model {
-	case "gpt-5.4-mini", "gpt-5.4", "gpt-5.5", "gpt-5-5-thinking":
-		return model
-	case "gpt-image-1", "gpt-image-2":
-		if normalizedRoute, _ := normalizeImageRoute(route); normalizedRoute != "responses" {
-			return model
-		}
-	}
-	return fallback
-}
-
 func normalizeImageMode(mode string) (string, bool) {
+	// Phase 7 collapsed the backend to cpa-only; any legacy studio/mix value
+	// (or empty) folds to cpa rather than erroring on an old config file.
 	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "", "studio", "mix":
-		return "studio", true
-	case "cpa":
+	case "", "studio", "mix", "cpa":
 		return "cpa", true
 	default:
 		return "", false

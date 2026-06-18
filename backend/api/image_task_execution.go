@@ -33,117 +33,85 @@ func (e *imageTaskDeferredError) Unwrap() error {
 	return e.cause
 }
 
-func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIndex int, lease *imageTaskLease) ([]imagehistory.Image, error) {
-	if lease == nil || lease.auth == nil {
-		return nil, fmt.Errorf("task lease is required")
+func (s *Server) executeImageTaskUnit(ctx context.Context, taskID string, unitIndex int, lease *imageTaskLease) ([]imagehistory.Image, string, error) {
+	if lease == nil {
+		return nil, "", fmt.Errorf("task lease is required")
 	}
 	task := s.imageTasks.copyTask(taskID)
 	if task == nil {
-		return nil, fmt.Errorf("task not found")
+		return nil, "", fmt.Errorf("task not found")
 	}
 
 	fakeReq := httptest.NewRequest("POST", "http://"+imageTaskFakeHost+"/api/image/tasks", nil).WithContext(ctx)
 	metadata := newImageRequestMetadata(task.Prompt, task.Size, task.Quality)
 	requestedModel := normalizeRequestedImageModel(task.Model, s.cfg.ChatGPT.Model)
 
+	// Replay prior conversation turns as multi-turn context into the /v1/responses
+	// request (chronological order; pruned to the configured turn/byte budgets).
+	// Only built when the responses route is active; degrades to no context on
+	// any read failure. The current turn is excluded inside the builder.
+	if s.responsesContextEnabled() {
+		ctx = withResponsesContext(ctx, s.buildResponsesContextTurns(ctx, task))
+	}
+
+	// Build the operation once; the runner closure executes against the
+	// per-user CPA credential.
 	var (
-		items     []map[string]any
-		retryable bool
-		err       error
+		operation        string
+		preferredAccount bool
+		run              func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error)
 	)
 
 	switch {
 	case task.SourceReference != nil:
-		mask, imageFiles, err := s.resolveTaskEditInputs(task)
+		mask, _, err := s.resolveTaskEditInputs(task)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if len(mask) == 0 {
-			return nil, fmt.Errorf("selection edit mask is required")
+			return nil, "", fmt.Errorf("selection edit mask is required")
 		}
-		items, retryable, err = s.runImageRequestWithAdmission(
-			ctx,
-			lease.auth,
-			lease.account,
-			lease.release,
-			lease.decision,
-			"selection-edit",
-			task.ResponseFormat,
-			true,
-			requestedModel,
-			false,
-			metadata,
-			func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-				return client.InpaintImageByMask(
-					ctx,
-					task.Prompt,
-					upstreamModel,
-					task.SourceReference.OriginalFileID,
-					task.SourceReference.OriginalGenID,
-					task.SourceReference.ConversationID,
-					task.SourceReference.ParentMessageID,
-					mask,
-					task.Size,
-					task.Quality,
-				)
-			},
-			fakeReq,
-			false,
-		)
-		_ = imageFiles
+		operation = "selection-edit"
+		preferredAccount = true
+		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+			return client.InpaintImageByMask(
+				ctx,
+				task.Prompt,
+				upstreamModel,
+				task.SourceReference.OriginalFileID,
+				task.SourceReference.OriginalGenID,
+				task.SourceReference.ConversationID,
+				task.SourceReference.ParentMessageID,
+				mask,
+				task.Size,
+				task.Quality,
+			)
+		}
 	case task.Mode == "edit" || len(task.SourceImages) > 0:
 		mask, imageFiles, err := s.resolveTaskEditInputs(task)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		responsesEligible := handler.SupportsResponsesInlineEdit(imageFiles, mask)
-		items, retryable, err = s.runImageRequestWithAdmission(
-			ctx,
-			lease.auth,
-			lease.account,
-			lease.release,
-			lease.decision,
-			"edit",
-			task.ResponseFormat,
-			false,
-			requestedModel,
-			responsesEligible,
-			metadata,
-			func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-				return client.EditImageByUpload(ctx, task.Prompt, upstreamModel, imageFiles, mask, task.Size, task.Quality)
-			},
-			fakeReq,
-			false,
-		)
+		operation = "edit"
+		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+			return client.EditImageByUpload(ctx, task.Prompt, upstreamModel, imageFiles, mask, task.Size, task.Quality)
+		}
 	default:
-		items, retryable, err = s.runImageRequestWithAdmission(
-			ctx,
-			lease.auth,
-			lease.account,
-			lease.release,
-			lease.decision,
-			"generate",
-			task.ResponseFormat,
-			false,
-			requestedModel,
-			true,
-			metadata,
-			func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
-				return client.GenerateImage(ctx, task.Prompt, upstreamModel, 1, task.Size, task.Quality, task.Background)
-			},
-			fakeReq,
-			false,
-		)
+		operation = "generate"
+		run = func(client imageWorkflowClient, upstreamModel string) ([]handler.ImageResult, error) {
+			return client.GenerateImage(ctx, task.Prompt, upstreamModel, 1, task.Size, task.Quality, task.Background)
+		}
 	}
 
-	lease.release = nil
+	// Resolve the per-user credential from the userID the scheduler injected
+	// into ctx (§8 item 3 — never a shared/account-pool fallback). Admission is
+	// skipped because the task manager already bounds concurrency via
+	// runningUnits.
+	items, assistantText, err := s.runPureCPAImageRequest(ctx, operation, task.ResponseFormat, requestedModel, preferredAccount, metadata, run, fakeReq, false)
 	if err != nil {
-		if retryable {
-			return nil, &imageTaskDeferredError{cause: err}
-		}
-		return nil, err
+		return nil, "", err
 	}
-	return historyImagesFromResponseItems(items), nil
+	return historyImagesFromResponseItems(items), assistantText, nil
 }
 
 func historyImagesFromResponseItems(items []map[string]any) []imagehistory.Image {
@@ -186,7 +154,7 @@ func (s *Server) resolveTaskEditInputs(task *imageTask) ([]byte, [][]byte, error
 	imageFiles := make([][]byte, 0)
 	var mask []byte
 	for _, source := range task.SourceImages {
-		data, err := s.resolveTaskSourceImageBytes(source)
+		data, err := s.resolveTaskSourceImageBytes(task.UserID, source)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -199,7 +167,7 @@ func (s *Server) resolveTaskEditInputs(task *imageTask) ([]byte, [][]byte, error
 	return mask, imageFiles, nil
 }
 
-func (s *Server) resolveTaskSourceImageBytes(source imageTaskSourceImage) ([]byte, error) {
+func (s *Server) resolveTaskSourceImageBytes(ownerUserID string, source imageTaskSourceImage) ([]byte, error) {
 	if strings.TrimSpace(source.DataURL) != "" {
 		payload, err := decodeTaskDataURL(strings.TrimSpace(source.DataURL))
 		if err != nil {
@@ -213,8 +181,17 @@ func (s *Server) resolveTaskSourceImageBytes(source imageTaskSourceImage) ([]byt
 	}
 	if index := strings.Index(rawURL, "/v1/files/image/"); index >= 0 {
 		name := rawURL[index+len("/v1/files/image/"):]
-		name = strings.ReplaceAll(name, "/", "-")
-		path := s.resolveImageFilePath(name)
+		// Preserve the "<userID>/<filename>" layout instead of flattening it,
+		// so the per-user subdirectory is honored on reuse (review #7).
+		owner, filename := splitImageOwnerPath(name)
+		// Cross-tenant guard (§8): a task may only reuse source images from its
+		// own user's namespace. If the URL carries a different owner segment,
+		// refuse — otherwise userA could reuse userB's stored image by crafting
+		// a URL. A blank owner (legacy flat layout) is allowed for back-compat.
+		if owner != "" && ownerUserID != "" && owner != ownerUserID {
+			return nil, fmt.Errorf("image not found")
+		}
+		path := s.resolveImageFilePath(owner, filename)
 		if path == "" {
 			return nil, fmt.Errorf("image not found")
 		}

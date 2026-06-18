@@ -49,6 +49,17 @@ Thumbs.db
 # Local backend config copy (not used by runtime)
 /backend/config.toml
 
+# Secrets: entry-ticket RS256 keypair (never commit key material)
+/backend/data/*.pem
+
+# Per-user image history (server-mode runtime data)
+/backend/data/image_history/
+
+# Local agent tooling / scratch output
+/.claude/
+/.serena/
+/output/
+
 # Frontend dependencies/build
 /web/node_modules/
 /web/.next/

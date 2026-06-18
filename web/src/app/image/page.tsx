@@ -10,10 +10,7 @@ import { ImageEditModal } from "@/components/image-edit-modal";
 import {
   cancelImageTask,
   consumeImageTaskStream,
-  fetchAccounts,
-  fetchConfig,
   listImageTasks,
-  type Account,
   type ImageTaskSnapshot,
   type ImageTaskView,
   type ImageQuality,
@@ -214,69 +211,6 @@ function formatConversationTime(value: string) {
   }).format(date);
 }
 
-function formatAvailableQuota(accounts: Account[], allowDisabled: boolean) {
-  const availableAccounts = accounts.filter((account) =>
-    isImageAccountUsable(account, allowDisabled),
-  );
-  return String(
-    availableAccounts.reduce(
-      (sum, account) => sum + getImageRemaining(account),
-      0,
-    ),
-  );
-}
-
-function getImageRemaining(account: Account) {
-  const limit = account.limits_progress?.find(
-    (item) => item.feature_name === "image_gen",
-  );
-  if (typeof limit?.remaining === "number") {
-    return Math.max(0, limit.remaining);
-  }
-  return Math.max(0, account.quota);
-}
-
-function isImageAccountUsable(account: Account, allowDisabled: boolean) {
-  const disabled = Boolean(account.disabled) || account.status === "禁用";
-  return (
-    (!disabled || allowDisabled) &&
-    account.status !== "异常" &&
-    account.status !== "限流" &&
-    getImageRemaining(account) > 0
-  );
-}
-
-function hasAvailablePaidImageAccount(
-  accounts: Account[],
-  allowDisabled: boolean,
-) {
-  return accounts.some(
-    (account) =>
-      isImageAccountUsable(account, allowDisabled) &&
-      (account.type === "Plus" ||
-        account.type === "Pro" ||
-        account.type === "Team"),
-  );
-}
-
-function hasUsableFreeLegacyAccount(
-  accounts: Account[],
-  allowDisabled: boolean,
-  imageMode: "studio" | "cpa",
-  freeImageRoute: string,
-) {
-  if (imageMode !== "studio" || freeImageRoute !== "legacy") {
-    return false;
-  }
-  return accounts.some(
-    (account) =>
-      isImageAccountUsable(account, allowDisabled) &&
-      account.type !== "Plus" &&
-      account.type !== "Pro" &&
-      account.type !== "Team",
-  );
-}
-
 async function normalizeConversationHistory(items: ImageConversation[]) {
   return items.map((item) => normalizeConversation(item));
 }
@@ -324,11 +258,15 @@ function mapTaskImagesToStoredImages(images: ImageTaskView["images"]): StoredIma
   return images.map((image, index) => ({
     id: image.file_id || image.gen_id || `task-image-${index}`,
     status:
-      image.error && !image.b64_json && !image.url
-        ? "error"
-        : image.b64_json || image.url
-          ? "success"
-          : "loading",
+      image.status === "text"
+        ? "text"
+        : image.error && !image.b64_json && !image.url
+          ? "error"
+          : image.b64_json || image.url
+            ? "success"
+            : image.assistant_text
+              ? "text"
+              : "loading",
     b64_json: image.b64_json,
     url: image.url,
     revised_prompt: image.revised_prompt,
@@ -338,6 +276,7 @@ function mapTaskImagesToStoredImages(images: ImageTaskView["images"]): StoredIma
     parent_message_id: image.parent_message_id,
     source_account_id: image.source_account_id,
     error: image.error,
+    assistant_text: image.assistant_text,
   }));
 }
 
@@ -416,7 +355,13 @@ function deriveTurnStatusFromImages(
   if (images.some((image) => image.status === "error")) {
     return "error";
   }
-  if (images.length > 0 && images.every((image) => image.status === "success")) {
+  // A text-only reply (model returned text but no image) is a successful turn.
+  if (
+    images.length > 0 &&
+    images.every(
+      (image) => image.status === "success" || image.status === "text",
+    )
+  ) {
     return "success";
   }
   return mapTaskStatusToTurnStatus(taskStatus);
@@ -527,7 +472,6 @@ function buildProcessingStatus(
 export default function ImagePage() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const didLoadQuotaRef = useRef(false);
   const mountedRef = useRef(true);
   const draftSelectionRef = useRef(false);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
@@ -553,15 +497,6 @@ export default function ImagePage() {
       ? window.matchMedia("(min-width: 1024px)").matches
       : false,
   );
-  const [availableQuota, setAvailableQuota] = useState("加载中");
-  const [availableAccounts, setAvailableAccounts] = useState<Account[]>([]);
-  const [allowDisabledStudioAccounts, setAllowDisabledStudioAccounts] =
-    useState(false);
-  const [configuredImageMode, setConfiguredImageMode] = useState<
-    "studio" | "cpa"
-  >("studio");
-  const [configuredFreeImageRoute, setConfiguredFreeImageRoute] =
-    useState("legacy");
   const [submitElapsedSeconds, setSubmitElapsedSeconds] = useState(0);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [isMobileComposerCollapsed, setIsMobileComposerCollapsed] =
@@ -731,29 +666,6 @@ export default function ImagePage() {
     () => Math.max(1, Math.min(8, Number(imageCount) || 1)),
     [imageCount],
   );
-  const hasAvailablePaidAccount = useMemo(
-    () =>
-      hasAvailablePaidImageAccount(
-        availableAccounts,
-        allowDisabledStudioAccounts,
-      ),
-    [allowDisabledStudioAccounts, availableAccounts],
-  );
-  const hasLegacyFreeAccountInPool = useMemo(
-    () =>
-      hasUsableFreeLegacyAccount(
-        availableAccounts,
-        allowDisabledStudioAccounts,
-        configuredImageMode,
-        configuredFreeImageRoute,
-      ),
-    [
-      allowDisabledStudioAccounts,
-      availableAccounts,
-      configuredFreeImageRoute,
-      configuredImageMode,
-    ],
-  );
   const currentResolutionPresets = useMemo(
     () =>
       imageAspectRatio === "auto"
@@ -768,23 +680,9 @@ export default function ImagePage() {
       ) ?? currentResolutionPresets[0],
     [currentResolutionPresets, imageResolutionTier],
   );
-  const currentRequestRequiresPaidAccount =
-    selectedResolutionPreset?.access === "paid";
-  const imageQualityDisabledReason = currentRequestRequiresPaidAccount
-    ? "当前输出档位会固定走 Paid 账号，质量参数应可正常生效。"
-    : "当前可用号池里仍有 Free legacy 链路账号，标准分辨率请求可能落到该链路，质量参数无法稳定作为正式参数传给上游，暂时置灰。";
-  const isImageQualityEnabled = useMemo(
-    () =>
-      configuredImageMode === "cpa" ||
-      !hasLegacyFreeAccountInPool ||
-      (currentRequestRequiresPaidAccount && hasAvailablePaidAccount),
-    [
-      configuredImageMode,
-      currentRequestRequiresPaidAccount,
-      hasAvailablePaidAccount,
-      hasLegacyFreeAccountInPool,
-    ],
-  );
+  // cpa-only model: credentials come from the user's selected channel key, so
+  // there is no account-pool gating. Every resolution tier is selectable and
+  // the quality control is always enabled.
   const imageResolutionTierOptions = useMemo(
     () =>
       currentResolutionPresets.map((item) => ({
@@ -793,16 +691,15 @@ export default function ImagePage() {
             ? item.label
             : `${item.access === "paid" ? "Paid" : "Free"} ${formatResolutionLabel(item.value)}${item.access === "paid" ? `（${item.label.replace("Paid ", "")}）` : ""}`,
         value: item.tier,
-        disabled: item.access === "paid" && !hasAvailablePaidAccount,
       })),
-    [currentResolutionPresets, hasAvailablePaidAccount, imageAspectRatio],
+    [currentResolutionPresets, imageAspectRatio],
   );
   const imageResolutionTierLabel = useMemo(
     () =>
       imageResolutionTierOptions.find(
-        (item) => item.value === imageResolutionTier && !item.disabled,
+        (item) => item.value === imageResolutionTier,
       )?.label ??
-      imageResolutionTierOptions.find((item) => !item.disabled)?.label ??
+      imageResolutionTierOptions[0]?.label ??
       "",
     [imageResolutionTier, imageResolutionTierOptions],
   );
@@ -810,22 +707,10 @@ export default function ImagePage() {
     () =>
       imageAspectRatio === "auto"
         ? ""
-        :
-      currentResolutionPresets.find(
-        (item) =>
-          item.tier === imageResolutionTier &&
-          (hasAvailablePaidAccount || item.access === "free"),
-      )?.value ??
-      currentResolutionPresets.find(
-        (item) => hasAvailablePaidAccount || item.access === "free",
-      )?.value ??
-      currentResolutionPresets[0].value,
-    [
-      currentResolutionPresets,
-      hasAvailablePaidAccount,
-      imageAspectRatio,
-      imageResolutionTier,
-    ],
+        : currentResolutionPresets.find(
+            (item) => item.tier === imageResolutionTier,
+          )?.value ?? currentResolutionPresets[0].value,
+    [currentResolutionPresets, imageAspectRatio, imageResolutionTier],
   );
   const imageResolutionAccess = useMemo<ImageResolutionAccess>(
     () => selectedResolutionPreset?.access ?? "free",
@@ -841,24 +726,19 @@ export default function ImagePage() {
           </div>
           <div className="mt-2">
             <span className="font-semibold text-stone-800">质量说明：</span>
-            输出质量会跟随当前质量档位；如果请求落到 Free legacy
-            链路，质量参数可能不会作为正式参数生效。
+            输出质量会跟随当前质量档位，最终效果以上游模型能力为准。
           </div>
         </>
       ) : (
         <>
           <div>
-            <span className="font-semibold text-stone-800">分辨率限制：</span>
-            Free 账号当前按约 1.57M 像素总量控制；Paid 账号的图片最长边最高支持
+            <span className="font-semibold text-stone-800">分辨率档位：</span>
+            标准档按约 1.57M 像素总量控制；高像素档（2K 及以上）的图片最长边最高支持
             3840。
           </div>
           <div className="mt-2">
-            <span className="font-semibold text-stone-800">账号要求：</span>
-            2K 及以上像素档仅 Paid 账号可用，包括 Team / Plus / Pro。
-          </div>
-          <div className="mt-2">
             <span className="font-semibold text-stone-800">Auto 模式补充：</span>
-            当比例切到 Auto 时，当前项目不会强制指定比例和分辨率，请直接在提示词里写明横竖版、画幅比例和目标输出尺寸。`Free / Paid` 只决定调度时优先使用哪类图片账号，不会把固定尺寸写进上游请求。
+            当比例切到 Auto 时，当前项目不会强制指定比例和分辨率，请直接在提示词里写明横竖版、画幅比例和目标输出尺寸，档位不会把固定尺寸写进上游请求。
           </div>
         </>
       ),
@@ -1009,63 +889,6 @@ export default function ImagePage() {
       streamAbort?.abort();
     };
   }, []);
-
-  useEffect(() => {
-    const loadQuota = async () => {
-      try {
-        const [accountsData, configData] = await Promise.all([
-          fetchAccounts(),
-          fetchConfig(),
-        ]);
-        const allowDisabled =
-          configData.chatgpt.imageMode === "studio" &&
-          configData.chatgpt.studioAllowDisabledImageAccounts;
-        setAllowDisabledStudioAccounts(allowDisabled);
-        setConfiguredImageMode(configData.chatgpt.imageMode);
-        setConfiguredFreeImageRoute(configData.chatgpt.freeImageRoute);
-        setAvailableAccounts(accountsData.items);
-        setAvailableQuota(
-          formatAvailableQuota(accountsData.items, allowDisabled),
-        );
-      } catch {
-        setAvailableAccounts([]);
-        setAllowDisabledStudioAccounts(false);
-        setConfiguredImageMode("studio");
-        setConfiguredFreeImageRoute("legacy");
-        setAvailableQuota((prev) => (prev === "加载中" ? "—" : prev));
-      }
-    };
-
-    if (didLoadQuotaRef.current) {
-      return;
-    }
-    didLoadQuotaRef.current = true;
-    void loadQuota();
-  }, []);
-
-  useEffect(() => {
-    const selectedPreset = currentResolutionPresets.find(
-      (item) => item.tier === imageResolutionTier,
-    );
-    if (
-      selectedPreset &&
-      (hasAvailablePaidAccount || selectedPreset.access === "free")
-    ) {
-      return;
-    }
-    const nextPreset = currentResolutionPresets.find(
-      (item) => hasAvailablePaidAccount || item.access === "free",
-    );
-    if (nextPreset && nextPreset.tier !== imageResolutionTier) {
-      setImageResolutionTier(nextPreset.tier);
-    }
-  }, [currentResolutionPresets, hasAvailablePaidAccount, imageResolutionTier]);
-
-  useEffect(() => {
-    if (!isImageQualityEnabled && imageQuality !== "high") {
-      setImageQuality("high");
-    }
-  }, [imageQuality, isImageQualityEnabled]);
 
   const scrollToBottom = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
@@ -1567,9 +1390,6 @@ export default function ImagePage() {
         imageSizeHint={imageSizeHint}
         imageQuality={imageQuality}
         imageQualityOptions={imageQualityOptions}
-        imageQualityDisabled={!isImageQualityEnabled}
-        imageQualityDisabledReason={imageQualityDisabledReason}
-        availableQuota={availableQuota}
         sourceImages={sourceImages}
         imagePrompt={imagePrompt}
         textareaRef={textareaRef}
@@ -1628,8 +1448,6 @@ export default function ImagePage() {
         imageResolutionTierOptions={imageResolutionTierOptions}
         imageQuality={imageQuality}
         imageQualityOptions={imageQualityOptions}
-        imageQualityDisabled={!isImageQualityEnabled}
-        imageQualityDisabledReason={imageQualityDisabledReason}
         onImageAspectRatioChange={(value) =>
           setImageAspectRatio(value as ImageAspectRatio)
         }

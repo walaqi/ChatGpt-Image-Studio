@@ -32,9 +32,6 @@ type PromptComposerProps = {
   imageSizeHint: ReactNode;
   imageQuality: ImageQuality;
   imageQualityOptions: Array<{ label: string; value: ImageQuality; description: string }>;
-  imageQualityDisabled: boolean;
-  imageQualityDisabledReason: string;
-  availableQuota: string;
   sourceImages: StoredSourceImage[];
   imagePrompt: string;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -66,9 +63,6 @@ export function PromptComposer({
   imageSizeHint,
   imageQuality,
   imageQualityOptions,
-  imageQualityDisabled,
-  imageQualityDisabledReason,
-  availableQuota,
   sourceImages,
   imagePrompt,
   textareaRef,
@@ -219,17 +213,14 @@ export function PromptComposer({
             {sizeHintTooltip}
 
             {showImageOutputControls ? (
-              <Select value={imageQuality} onValueChange={onImageQualityChange} disabled={imageQualityDisabled}>
+              <Select value={imageQuality} onValueChange={onImageQualityChange}>
                 <SelectTrigger
                   className={cn(
                     "h-10 w-[136px] shrink-0 rounded-full border-stone-200 bg-white text-sm font-medium text-stone-700 shadow-none focus-visible:ring-0",
                     "h-9 w-[108px] text-[13px] sm:h-10 sm:w-[136px] sm:text-sm",
-                    imageQualityDisabled && "cursor-not-allowed bg-stone-50 text-stone-400 opacity-80",
                   )}
                   title={
-                    imageQualityDisabled
-                      ? imageQualityDisabledReason
-                      : imageQualityOptions.find((item) => item.value === imageQuality)?.description
+                    imageQualityOptions.find((item) => item.value === imageQuality)?.description
                   }
                 >
                   <SelectValue>{`${imageQualityPrefix} ${imageQualityLabel}`}</SelectValue>
@@ -258,10 +249,6 @@ export function PromptComposer({
                 />
               </div>
             ) : null}
-
-            <span className="shrink-0 rounded-full bg-stone-100 px-2.5 py-1.5 text-[11px] font-medium text-stone-600 sm:px-3 sm:py-2 sm:text-xs">
-              剩余额度 {availableQuota}
-            </span>
           </div>
         </div>
 

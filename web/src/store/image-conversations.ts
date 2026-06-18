@@ -3,7 +3,6 @@
 import localforage from "localforage";
 
 import {
-  fetchConfig,
   type ImageModel,
   type ImageQuality,
   type ImageResolutionAccess,
@@ -24,7 +23,7 @@ export type StoredSourceImage = {
 
 export type StoredImage = {
   id: string;
-  status?: "loading" | "success" | "error";
+  status?: "loading" | "success" | "error" | "text";
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
@@ -34,6 +33,10 @@ export type StoredImage = {
   parent_message_id?: string;
   source_account_id?: string;
   error?: string;
+  // assistant_text is the model's textual reply for this turn (Responses route):
+  // shown alongside an image, or on its own for a text-only reply such as a
+  // content refusal. status "text" marks a text-only result (no image bytes).
+  assistant_text?: string;
 };
 
 export type ImageConversationStatus =
@@ -294,9 +297,14 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
   if (
     image.status === "loading" ||
     image.status === "error" ||
-    image.status === "success"
+    image.status === "success" ||
+    image.status === "text"
   ) {
     return image;
+  }
+  // A result with no image bytes but a textual reply is a text-only turn.
+  if (!image.b64_json && !image.url && image.assistant_text) {
+    return { ...image, status: "text" };
   }
   return {
     ...image,
@@ -415,25 +423,13 @@ export function normalizeConversation(
 }
 
 async function getImageConversationStorageMode() {
-  if (cachedImageConversationStorageMode) {
-    return cachedImageConversationStorageMode;
-  }
-  try {
-    const config = await fetchConfig();
-    setCachedImageConversationStorageMode(
-      config.storage.imageConversationStorage === "server"
-        ? "server"
-        : "browser",
-    );
-    return cachedImageConversationStorageMode;
-  } catch (error) {
-    if (cachedImageConversationStorageMode) {
-      return cachedImageConversationStorageMode;
-    }
-    throw error instanceof Error
-      ? error
-      : new Error("无法确定会话记录存储模式");
-  }
+  // Multi-tenant embedded model (docs/multi-tenant-redesign.md §4.6, review #5):
+  // history ALWAYS uses server mode. Browser/localforage history is keyed by a
+  // fixed name, so two users opening the iframe in the same browser would read
+  // each other's local history. Forcing server mode routes history through the
+  // backend's per-userID store and keeps nothing tenant-specific in the browser.
+  setCachedImageConversationStorageMode("server");
+  return "server" as const;
 }
 
 async function listServerImageConversations(): Promise<ImageConversation[]> {
@@ -652,6 +648,23 @@ export async function deleteImageConversation(id: string): Promise<void> {
   const items = await loadConversationCache();
   cachedConversations = items.filter((item) => item.id !== id);
   await persistConversationCache();
+}
+
+// clearLocalImageConversationCache wipes every browser-side trace of image
+// history: the in-memory snapshot caches plus the localforage instance (whose
+// name is fixed, NOT namespaced by userID). The multi-tenant model forces server
+// history mode, so this localforage data is only ever stale residue from an
+// older browser-mode session — but two users sharing one browser would otherwise
+// read each other's leftover local history. Call this when a new entry ticket is
+// exchanged (the user-switch signal), so no prior user's data survives the switch.
+export async function clearLocalImageConversationCache(): Promise<void> {
+  cachedConversations = null;
+  cachedConversationsStorageMode = null;
+  loadPromise = null;
+  writeQueue = writeQueue.then(async () => {
+    await imageConversationStorage.removeItem(IMAGE_CONVERSATIONS_KEY);
+  });
+  await writeQueue;
 }
 
 export async function clearImageConversations(): Promise<void> {

@@ -3,27 +3,16 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	"chatgpt2api/handler"
 )
 
 func TestCreateImageTaskRunsToSuccess(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, recorder := newCPATestServer(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/image/tasks", strings.NewReader(`{
 		"conversationId":"conv-task-1",
@@ -35,7 +24,7 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 		"size":"1248x1248",
 		"quality":"high"
 	}`))
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -60,7 +49,7 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 
 	waitForTaskStatus(t, server, payload.Task.ID, imageTaskStatusSucceeded)
 
-	task, _, err := server.imageTasks.getTask(payload.Task.ID)
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, payload.Task.ID)
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -73,22 +62,14 @@ func TestCreateImageTaskRunsToSuccess(t *testing.T) {
 	if !strings.HasPrefix(task.Images[0].URL, "/v1/files/image/") {
 		t.Fatalf("task image url = %q, want relative cached file url", task.Images[0].URL)
 	}
-	if recorder.officialCalls != 1 {
-		t.Fatalf("officialCalls = %d, want 1", recorder.officialCalls)
+	if recorder.calls() != 1 {
+		t.Fatalf("cpa calls = %d, want 1", recorder.calls())
 	}
 }
 
-func TestCreateImageTaskSelectionEditBypassesPolicySnapshot(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Plus",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+func TestCreateImageTaskSelectionEditRunsInpaint(t *testing.T) {
+	server, recorder := newCPATestServer(t)
 
-	accountID := compatPrimaryAccountID(t, server)
 	req := httptest.NewRequest(http.MethodPost, "/api/image/tasks", strings.NewReader(`{
 		"conversationId":"conv-selection-1",
 		"turnId":"turn-selection-1",
@@ -109,18 +90,10 @@ func TestCreateImageTaskSelectionEditBypassesPolicySnapshot(t *testing.T) {
 			"original_gen_id":"gen-1",
 			"conversation_id":"conv-1",
 			"parent_message_id":"msg-1",
-			"source_account_id":"`+accountID+`"
-		},
-		"policy":{
-			"enabled":true,
-			"sortMode":"imported_at",
-			"groupSize":10,
-			"enabledGroupIndexes":[999],
-			"reserveMode":"daily_first_seen_percent",
-			"reservePercent":20
+			"source_account_id":"acct-1"
 		}
 	}`))
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -140,9 +113,6 @@ func TestCreateImageTaskSelectionEditBypassesPolicySnapshot(t *testing.T) {
 	}
 
 	waitForTaskStatus(t, server, payload.Task.ID, imageTaskStatusSucceeded)
-	if recorder.officialCalls != 1 {
-		t.Fatalf("officialCalls = %d, want 1 source-bound official call", recorder.officialCalls)
-	}
 	if len(recorder.callSequence) != 1 {
 		t.Fatalf("callSequence = %#v, want 1 entry", recorder.callSequence)
 	}
@@ -151,245 +121,10 @@ func TestCreateImageTaskSelectionEditBypassesPolicySnapshot(t *testing.T) {
 	}
 }
 
-func TestCreateImageEditTaskHighResolutionUsesPaidAccount(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "free-priority.json",
-				accessToken: "token-free-priority",
-				accountType: "Free",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-			{
-				fileName:    "paid-priority.json",
-				accessToken: "token-paid-priority",
-				accountType: "Plus",
-				priority:    10,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-	})
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID: "conv-edit-paid-1",
-		TurnID:         "turn-edit-paid-1",
-		Mode:           "edit",
-		Prompt:         "high resolution edit",
-		Model:          "gpt-image-2",
-		Count:          1,
-		Size:           "3840x2160",
-		Quality:        "high",
-		SourceImages: []imageTaskSourceImagePayload{
-			{
-				ID:      "source-1",
-				Role:    "image",
-				Name:    "source.png",
-				DataURL: "data:image/png;base64,aW1hZ2U=",
-			},
-		},
-	}); err != nil {
-		t.Fatalf("createTask() returned error: %v", err)
-	}
-
-	waitForTaskStatus(t, server, "turn-edit-paid-1", imageTaskStatusSucceeded)
-	if len(recorder.callSequence) == 0 {
-		t.Fatal("callSequence = empty, want paid edit execution")
-	}
-	lastCall := recorder.callSequence[len(recorder.callSequence)-1]
-	if !strings.Contains(lastCall, "token-paid-priority") {
-		t.Fatalf("callSequence = %#v, want paid account selected for high-resolution edit", recorder.callSequence)
-	}
-}
-
-func TestCreateImageGenerateTaskAutoFreeUsesFreeAccount(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "free-auto.json",
-				accessToken: "token-free-auto",
-				accountType: "Free",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-			{
-				fileName:    "paid-auto.json",
-				accessToken: "token-paid-auto",
-				accountType: "Plus",
-				priority:    10,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-	})
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID:   "conv-generate-auto-free-1",
-		TurnID:           "turn-generate-auto-free-1",
-		Mode:             "generate",
-		Prompt:           "auto free generate",
-		Model:            "gpt-image-2",
-		Count:            1,
-		Size:             "",
-		ResolutionAccess: "free",
-		Quality:          "high",
-	}); err != nil {
-		t.Fatalf("createTask() returned error: %v", err)
-	}
-
-	waitForTaskStatus(t, server, "turn-generate-auto-free-1", imageTaskStatusSucceeded)
-	if len(recorder.callSequence) == 0 {
-		t.Fatal("callSequence = empty, want free auto execution")
-	}
-	lastCall := recorder.callSequence[len(recorder.callSequence)-1]
-	if !strings.Contains(lastCall, "token-free-auto") {
-		t.Fatalf("callSequence = %#v, want free account selected for auto-free generate", recorder.callSequence)
-	}
-}
-
-func TestCreateImageGenerateTaskAutoPaidUsesPaidAccount(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "free-priority-auto-paid.json",
-				accessToken: "token-free-priority-auto-paid",
-				accountType: "Free",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-			{
-				fileName:    "paid-priority-auto-paid.json",
-				accessToken: "token-paid-priority-auto-paid",
-				accountType: "Plus",
-				priority:    10,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-	})
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID:   "conv-generate-auto-paid-1",
-		TurnID:           "turn-generate-auto-paid-1",
-		Mode:             "generate",
-		Prompt:           "auto paid generate",
-		Model:            "gpt-image-2",
-		Count:            1,
-		Size:             "",
-		ResolutionAccess: "paid",
-		Quality:          "high",
-	}); err != nil {
-		t.Fatalf("createTask() returned error: %v", err)
-	}
-
-	waitForTaskStatus(t, server, "turn-generate-auto-paid-1", imageTaskStatusSucceeded)
-	if len(recorder.callSequence) == 0 {
-		t.Fatal("callSequence = empty, want paid auto execution")
-	}
-	lastCall := recorder.callSequence[len(recorder.callSequence)-1]
-	if !strings.Contains(lastCall, "token-paid-priority-auto-paid") {
-		t.Fatalf("callSequence = %#v, want paid account selected for auto-paid generate", recorder.callSequence)
-	}
-}
-
-func TestCreateImageGenerateTaskAutoPaidRequiresPaidAccount(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "free-only-auto-paid.json",
-				accessToken: "token-free-only-auto-paid",
-				accountType: "Free",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-	})
-
-	_, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID:   "conv-generate-auto-paid-no-paid",
-		TurnID:           "turn-generate-auto-paid-no-paid",
-		Mode:             "generate",
-		Prompt:           "auto paid without paid account",
-		Model:            "gpt-image-2",
-		Count:            1,
-		Size:             "",
-		ResolutionAccess: "paid",
-		Quality:          "high",
-	})
-	if err == nil {
-		t.Fatal("createTask() returned nil error, want paid account validation failure")
-	}
-	var reqErr *requestError
-	if !errors.As(err, &reqErr) {
-		t.Fatalf("createTask() error = %T, want *requestError", err)
-	}
-	if reqErr.code != "paid_resolution_requires_paid_account" {
-		t.Fatalf("request error code = %q, want paid_resolution_requires_paid_account", reqErr.code)
-	}
-}
-
-func waitForTaskStatus(t *testing.T, server *Server, taskID string, want imageTaskStatus) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(taskID)
-		if err == nil && task != nil && imageTaskStatus(task.Status) == want {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	task, _, err := server.imageTasks.getTask(taskID)
-	if err != nil {
-		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
-	}
-	t.Fatalf("task %s status = %q, want %q", taskID, task.Status, want)
-}
-
 func TestImageTaskStreamWritesInitPayload(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-stream-1",
 		TurnID:         "turn-stream-1",
 		Mode:           "generate",
@@ -404,7 +139,7 @@ func TestImageTaskStreamWritesInitPayload(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/image/tasks/stream", nil).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+server.cfg.App.AuthKey)
+	req.AddCookie(mintTestSession(t, server, defaultTestUserID))
 	rec := httptest.NewRecorder()
 
 	var wg sync.WaitGroup
@@ -431,14 +166,7 @@ func TestImageTaskStreamWritesInitPayload(t *testing.T) {
 }
 
 func TestSchedulePublishesQueuedBlockerUpdatesWhenConcurrencyIsFull(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	task, err := server.imageTasks.newTask(createImageTaskRequest{
 		ConversationID: "conv-blocker-1",
@@ -458,7 +186,7 @@ func TestSchedulePublishesQueuedBlockerUpdatesWhenConcurrencyIsFull(t *testing.T
 	server.imageTasks.runningUnits = server.imageTasks.maxRunningLocked()
 	server.imageTasks.mu.Unlock()
 
-	subID, ch := server.imageTasks.subscribe()
+	subID, ch := server.imageTasks.subscribe("")
 	defer server.imageTasks.unsubscribe(subID)
 
 	if server.imageTasks.tryScheduleOne() {
@@ -488,164 +216,11 @@ func TestSchedulePublishesQueuedBlockerUpdatesWhenConcurrencyIsFull(t *testing.T
 	}
 }
 
-func TestCreateImageTaskRetriesRateLimitedAccount(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "limited.json",
-				accessToken: "token-limited",
-				accountType: "Free",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-			{
-				fileName:    "healthy.json",
-				accessToken: "token-healthy",
-				accountType: "Free",
-				priority:    10,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-		behavior: compatClientBehavior{
-			officialGenerateErrors: map[string]error{
-				"token-limited": errors.New("backend-api failed: HTTP 429 too many requests"),
-			},
-		},
-	})
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID: "conv-retry-1",
-		TurnID:         "turn-retry-1",
-		Mode:           "generate",
-		Prompt:         "retry please",
-		Model:          "gpt-image-2",
-		Count:          1,
-	}); err != nil {
-		t.Fatalf("createTask() returned error: %v", err)
-	}
-
-	waitForTaskStatus(t, server, "turn-retry-1", imageTaskStatusSucceeded)
-
-	task, _, err := server.imageTasks.getTask("turn-retry-1")
-	if err != nil {
-		t.Fatalf("getTask() returned error: %v", err)
-	}
-	if len(task.Images) != 1 || task.Images[0].URL == "" {
-		t.Fatalf("task images = %#v, want successful cached image", task.Images)
-	}
-	if len(recorder.callSequence) < 2 {
-		t.Fatalf("callSequence = %#v, want limited then fallback attempt", recorder.callSequence)
-	}
-	if !strings.Contains(recorder.callSequence[0], "token-limited") {
-		t.Fatalf("callSequence[0] = %q, want first limited account", recorder.callSequence[0])
-	}
-	if !strings.Contains(recorder.callSequence[len(recorder.callSequence)-1], "token-healthy") {
-		t.Fatalf("callSequence = %#v, want fallback healthy account", recorder.callSequence)
-	}
-}
-
-func TestCreateImageTaskRetriesTransientResponsesSSEError(t *testing.T) {
-	server, recorder := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Plus",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{
-		accounts: []compatSeedAccount{
-			{
-				fileName:    "transient-paid.json",
-				accessToken: "token-transient-paid",
-				accountType: "Plus",
-				priority:    100,
-				quota:       5,
-				status:      "正常",
-			},
-		},
-	})
-
-	var transientCalls int32
-	server.responsesClientFactory = func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
-		_ = proxyURL
-		_ = authData
-		_ = requestConfig
-		recorder.responsesCalls++
-		errOnce := error(nil)
-		if accessToken == "token-transient-paid" && atomic.AddInt32(&transientCalls, 1) == 1 {
-			errOnce = errors.New("responses SSE read error: stream error: stream ID 1; INTERNAL_ERROR; received from peer")
-		}
-		return &compatStubWorkflowClient{
-			factory:     "responses",
-			token:       accessToken,
-			recorder:    recorder,
-			generateErr: errOnce,
-		}
-	}
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
-		ConversationID: "conv-transient-1",
-		TurnID:         "turn-transient-1",
-		Mode:           "generate",
-		Prompt:         "retry transient stream",
-		Model:          "gpt-image-2",
-		Count:          1,
-		Size:           "2048x2048",
-		Quality:        "high",
-	}); err != nil {
-		t.Fatalf("createTask() returned error: %v", err)
-	}
-
-	waitForTaskPredicate(t, server, "turn-transient-1", func(task *imageTaskView) bool {
-		return task.Status == imageTaskStatusSucceeded
-	})
-
-	task, _, err := server.imageTasks.getTask("turn-transient-1")
-	if err != nil {
-		t.Fatalf("getTask() returned error: %v", err)
-	}
-	if len(task.Images) != 1 || task.Images[0].URL == "" {
-		t.Fatalf("task images = %#v, want successful cached image", task.Images)
-	}
-	if got := atomic.LoadInt32(&transientCalls); got < 2 {
-		t.Fatalf("transientCalls = %d, want retry after first SSE failure", got)
-	}
-}
-
 func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
+	useParallelCPAClient(server, 180*time.Millisecond)
 
-	var active int32
-	var maxActive int32
-	server.officialClientFactory = func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
-		_ = proxyURL
-		_ = authData
-		_ = requestConfig
-		return &parallelGenerateWorkflowClient{
-			token:     accessToken,
-			active:    &active,
-			maxActive: &maxActive,
-			delay:     180 * time.Millisecond,
-		}
-	}
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-cancel-1",
 		TurnID:         "turn-cancel-1",
 		Mode:           "generate",
@@ -660,13 +235,13 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.cancelTask("turn-cancel-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask(defaultTestUserID, "turn-cancel-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
 	waitForTaskStatus(t, server, "turn-cancel-1", imageTaskStatusCancelled)
 
-	task, _, err := server.imageTasks.getTask("turn-cancel-1")
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, "turn-cancel-1")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -682,28 +257,10 @@ func TestCancelRunningImageTaskCancelsQueuedUnits(t *testing.T) {
 }
 
 func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
+	useParallelCPAClient(server, 5*time.Second)
 
-	server.officialClientFactory = func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
-		_ = proxyURL
-		_ = authData
-		_ = requestConfig
-		return &parallelGenerateWorkflowClient{
-			token:     accessToken,
-			active:    new(int32),
-			maxActive: new(int32),
-			delay:     5 * time.Second,
-		}
-	}
-
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-cancel-fast-1",
 		TurnID:         "turn-cancel-fast-1",
 		Mode:           "generate",
@@ -719,7 +276,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 	})
 
 	startedAt := time.Now()
-	if _, err := server.imageTasks.cancelTask("turn-cancel-fast-1"); err != nil {
+	if _, err := server.imageTasks.cancelTask(defaultTestUserID, "turn-cancel-fast-1"); err != nil {
 		t.Fatalf("cancelTask() returned error: %v", err)
 	}
 
@@ -731,14 +288,7 @@ func TestCancelRunningImageTaskInterruptsUpstreamRequest(t *testing.T) {
 }
 
 func TestDeferredQueuedUnitSchedulesRetryWakeup(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	task, err := server.imageTasks.newTask(createImageTaskRequest{
 		ConversationID: "conv-backoff-1",
@@ -773,30 +323,12 @@ func TestDeferredQueuedUnitSchedulesRetryWakeup(t *testing.T) {
 }
 
 func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
-
+	server, _ := newCPATestServer(t)
 	server.cfg.Server.MaxImageConcurrency = 1
 	server.cfg.Server.ImageTaskQueueTTLSeconds = 1
-	server.officialClientFactory = func(accessToken, proxyURL string, authData map[string]any, requestConfig handler.ImageRequestConfig) imageWorkflowClient {
-		_ = proxyURL
-		_ = authData
-		_ = requestConfig
-		return &parallelGenerateWorkflowClient{
-			token:     accessToken,
-			active:    new(int32),
-			maxActive: new(int32),
-			delay:     1500 * time.Millisecond,
-		}
-	}
+	useParallelCPAClient(server, 1500*time.Millisecond)
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-expire-runner",
 		TurnID:         "turn-expire-runner",
 		Mode:           "generate",
@@ -810,7 +342,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 		return task.Status == imageTaskStatusRunning
 	})
 
-	if _, err := server.imageTasks.createTask(createImageTaskRequest{
+	if _, err := server.imageTasks.createTask(defaultTestUserID, createImageTaskRequest{
 		ConversationID: "conv-expire-queued",
 		TurnID:         "turn-expire-queued",
 		Mode:           "generate",
@@ -823,7 +355,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 
 	waitForTaskStatus(t, server, "turn-expire-queued", imageTaskStatusExpired)
 
-	task, _, err := server.imageTasks.getTask("turn-expire-queued")
+	task, _, err := server.imageTasks.getTask(defaultTestUserID, "turn-expire-queued")
 	if err != nil {
 		t.Fatalf("getTask() returned error: %v", err)
 	}
@@ -836,14 +368,7 @@ func TestQueuedImageTaskExpiresBeforeFirstRun(t *testing.T) {
 }
 
 func TestCompletedImageTaskIsPrunedAfterRetention(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	task, err := server.imageTasks.newTask(createImageTaskRequest{
 		ConversationID: "conv-prune-1",
@@ -868,10 +393,10 @@ func TestCompletedImageTaskIsPrunedAfterRetention(t *testing.T) {
 		t.Fatal("tryScheduleOne() = false, want prune cycle to run")
 	}
 
-	if _, _, err := server.imageTasks.getTask(task.ID); err == nil {
+	if _, _, err := server.imageTasks.getTask(defaultTestUserID, task.ID); err == nil {
 		t.Fatalf("getTask(%s) error = nil, want pruned task to be removed", task.ID)
 	}
-	items, snapshot := server.imageTasks.listTasks()
+	items, snapshot := server.imageTasks.listTasks("")
 	if len(items) != 0 {
 		t.Fatalf("len(items) = %d, want 0 after pruning", len(items))
 	}
@@ -881,14 +406,7 @@ func TestCompletedImageTaskIsPrunedAfterRetention(t *testing.T) {
 }
 
 func TestTaskSnapshotCountsQueuedUnitsWithinRunningParentTask(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	task, err := server.imageTasks.newTask(createImageTaskRequest{
 		ConversationID: "conv-parent-1",
@@ -910,7 +428,7 @@ func TestTaskSnapshotCountsQueuedUnitsWithinRunningParentTask(t *testing.T) {
 	server.imageTasks.tasks[task.ID] = task
 	server.imageTasks.order = append(server.imageTasks.order, task.ID)
 	server.imageTasks.runningUnits = 2
-	snapshot := server.imageTasks.snapshotLocked()
+	snapshot := server.imageTasks.snapshotLocked("")
 	server.imageTasks.mu.Unlock()
 
 	if snapshot.Running != 2 {
@@ -925,14 +443,7 @@ func TestTaskSnapshotCountsQueuedUnitsWithinRunningParentTask(t *testing.T) {
 }
 
 func TestTaskQueuePositionCountsQueuedUnits(t *testing.T) {
-	server, _ := newImageModeCompatTestServerWithOptions(t, imageModeCompatScenario{
-		imageMode:   "studio",
-		accountType: "Free",
-		freeRoute:   "legacy",
-		freeModel:   "auto",
-		paidRoute:   "responses",
-		paidModel:   "gpt-5.4-mini",
-	}, compatTestServerOptions{})
+	server, _ := newCPATestServer(t)
 
 	firstTask, err := server.imageTasks.newTask(createImageTaskRequest{
 		ConversationID: "conv-queue-a",
@@ -967,22 +478,4 @@ func TestTaskQueuePositionCountsQueuedUnits(t *testing.T) {
 	if view.QueuePosition != 4 {
 		t.Fatalf("QueuePosition = %d, want 4 because 3 queued units are ahead", view.QueuePosition)
 	}
-}
-
-func waitForTaskPredicate(t *testing.T, server *Server, taskID string, predicate func(*imageTaskView) bool) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		task, _, err := server.imageTasks.getTask(taskID)
-		if err == nil && task != nil && predicate(task) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	task, _, err := server.imageTasks.getTask(taskID)
-	if err != nil {
-		t.Fatalf("getTask(%s) returned error: %v", taskID, err)
-	}
-	t.Fatalf("task %s did not satisfy predicate, current status = %q", taskID, task.Status)
 }

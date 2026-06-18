@@ -3,6 +3,7 @@
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { CredentialPicker } from "./credential-picker";
 type WorkspaceHeaderProps = {
   historyCollapsed?: boolean;
   selectedConversationTitle?: string | null;
@@ -68,23 +69,26 @@ export function WorkspaceHeader({
               ) : null}
             </div>
           </div>
-          {showHistoryToggle && onToggleHistory ? (
-            <Button
-              type="button"
-              variant="outline"
-              className="h-8 shrink-0 rounded-full border-stone-200 bg-white px-3 text-stone-700 shadow-none dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] sm:h-9 sm:px-4"
-              onClick={onToggleHistory}
-            >
-              {historyCollapsed ? (
-                <PanelLeftOpen className="size-4" />
-              ) : (
-                <PanelLeftClose className="size-4" />
-              )}
-              <span className="hidden sm:inline">
-                {historyCollapsed ? "展开历史" : "收起历史"}
-              </span>
-            </Button>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-2">
+            <CredentialPicker />
+            {showHistoryToggle && onToggleHistory ? (
+              <Button
+                type="button"
+                variant="outline"
+                className="h-8 shrink-0 rounded-full border-stone-200 bg-white px-3 text-stone-700 shadow-none dark:border-[var(--studio-border)] dark:bg-[var(--studio-panel-soft)] dark:text-[var(--studio-text)] sm:h-9 sm:px-4"
+                onClick={onToggleHistory}
+              >
+                {historyCollapsed ? (
+                  <PanelLeftOpen className="size-4" />
+                ) : (
+                  <PanelLeftClose className="size-4" />
+                )}
+                <span className="hidden sm:inline">
+                  {historyCollapsed ? "展开历史" : "收起历史"}
+                </span>
+              </Button>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>

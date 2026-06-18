@@ -16,9 +16,7 @@ import (
 	"time"
 
 	"chatgpt2api/api"
-	"chatgpt2api/internal/accounts"
 	"chatgpt2api/internal/buildinfo"
-	"chatgpt2api/internal/cliproxy"
 	"chatgpt2api/internal/config"
 	"chatgpt2api/internal/configstore"
 )
@@ -71,21 +69,13 @@ func main() {
 		)
 	}
 
-	store, err := accounts.NewStore(cfg)
-	if err != nil {
-		fatalStartup(logger, paths, "初始化账号存储失败", err)
-	}
-
-	syncTimeout := time.Duration(max(10, cfg.Sync.RequestTimeout)) * time.Second
-	syncClient := cliproxy.New(cfg.Sync.Enabled, cfg.Sync.BaseURL, cfg.Sync.ManagementKey, cfg.Sync.ProviderType, syncTimeout, cfg.SyncProxyURL())
-
 	host := envString("SERVER_HOST", cfg.Server.Host)
 	port := envInt("SERVER_PORT", cfg.Server.Port)
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           api.SetupRouter(cfg, store, syncClient),
+		Handler:           api.SetupRouter(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

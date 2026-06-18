@@ -3,13 +3,13 @@ package api
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"chatgpt2api/internal/buildinfo"
+	"chatgpt2api/internal/identity"
 	"chatgpt2api/internal/outboundproxy"
 )
 
@@ -87,7 +87,7 @@ func (s *Server) handleStartupCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.collectRuntimeStatus())
+	writeJSON(w, http.StatusOK, s.collectRuntimeStatus(r.Context()))
 }
 
 func (s *Server) handleExportDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -102,13 +102,13 @@ func (s *Server) handleExportDiagnostics(w http.ResponseWriter, r *http.Request)
 			"buildTime": buildinfo.BuildTime,
 		},
 		StartupCheck: s.runStartupCheck(r.Context()),
-		Runtime:      s.collectRuntimeStatus(),
+		Runtime:      s.collectRuntimeStatus(r.Context()),
 		Config:       s.maskSensitiveConfig(s.buildConfigPayload()),
 		RequestLogs:  s.reqLogs.list(100),
 	})
 }
 
-func (s *Server) collectRuntimeStatus() runtimeStatusResponse {
+func (s *Server) collectRuntimeStatus(ctx context.Context) runtimeStatusResponse {
 	now := time.Now()
 	out := runtimeStatusResponse{
 		Timestamp: now.Format(time.RFC3339Nano),
@@ -125,7 +125,8 @@ func (s *Server) collectRuntimeStatus() runtimeStatusResponse {
 		out.Admission.Queued = snapshot.Queued
 	}
 	if s.imageTasks != nil {
-		_, snapshot := s.imageTasks.listTasks()
+		userID, _ := identity.UserIDFromContext(ctx)
+		_, snapshot := s.imageTasks.listTasks(userID)
 		if snapshot != nil {
 			out.Tasks.Total = snapshot.Total
 			out.Tasks.Running = snapshot.Running
@@ -133,20 +134,6 @@ func (s *Server) collectRuntimeStatus() runtimeStatusResponse {
 			out.Tasks.ActiveSources = snapshot.ActiveSources
 			out.Tasks.FinalStatuses = snapshot.FinalStatuses
 			out.Tasks.RetentionSeconds = snapshot.RetentionSeconds
-		}
-	}
-
-	accountsList, err := s.getStore().ListAccounts()
-	if err == nil {
-		allowDisabled := s.allowDisabledStudioImageAccounts()
-		out.Accounts.Total = len(accountsList)
-		for _, account := range accountsList {
-			if isImageAccountUsable(account, allowDisabled) {
-				out.Accounts.Available++
-				if account.Type == "Plus" || account.Type == "Pro" || account.Type == "Team" {
-					out.Accounts.AvailablePaid++
-				}
-			}
 		}
 	}
 
@@ -196,77 +183,24 @@ func (s *Server) runStartupCheck(ctx context.Context) startupCheckResponse {
 		return checkStatusPass, fmt.Sprintf("服务已启动：%s:%d", strings.TrimSpace(s.cfg.Server.Host), s.cfg.Server.Port), ""
 	})
 
-	addCheck("proxy", "代理连通性", func() (string, string, string) {
-		if !s.cfg.Proxy.Enabled {
-			return checkStatusWarn, "未启用代理", "如需走代理访问官方链路，请先启用并填写 proxy.url"
-		}
-		if err := outboundproxy.Validate(s.cfg.Proxy.URL); err != nil {
-			return checkStatusFail, fmt.Sprintf("代理配置无效：%v", err), "请检查代理 URL、协议与端口"
-		}
-		target, err := resolveProxyDialTarget(s.cfg.Proxy.URL)
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("代理地址解析失败：%v", err), ""
-		}
-		conn, dialErr := net.DialTimeout("tcp", target, 3*time.Second)
-		if dialErr != nil {
-			return checkStatusFail, fmt.Sprintf("代理不可达：%v", dialErr), "请确认代理程序已启动且端口正确"
-		}
-		_ = conn.Close()
-		return checkStatusPass, fmt.Sprintf("代理可连接：%s", target), ""
-	})
-
-	addCheck("chatgpt", "官方站点连通", func() (string, string, string) {
-		if result.Mode != "studio" {
-			return checkStatusWarn, "当前不是 studio 模式，已跳过官方链路检测", ""
-		}
-		statusCode, err := probeEndpoint(ctx, "https://chatgpt.com", s.cfg.ChatGPTProxyURL(), 8*time.Second)
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("访问 chatgpt.com 失败：%v", err), "请检查代理、网络或防火墙设置"
-		}
-		return checkStatusPass, fmt.Sprintf("chatgpt.com 可达，HTTP %d", statusCode), ""
-	})
-
 	addCheck("cpa", "CPA 服务连通", func() (string, string, string) {
 		baseURL := strings.TrimSpace(s.cfg.CPAImageBaseURL())
 		if baseURL == "" {
-			if result.Mode == "cpa" {
-				return checkStatusFail, "CPA base URL 未配置", "请在配置中填写 cpa.base_url 或 sync.base_url"
-			}
-			return checkStatusWarn, "CPA base URL 未配置", ""
+			return checkStatusFail, "CPA base URL 未配置", "请在配置中填写 cpa.base_url"
 		}
 		normalized := normalizeProbeURL(baseURL)
 		statusCode, err := probeEndpoint(ctx, normalized, "", 5*time.Second)
 		if err != nil {
-			if result.Mode == "cpa" {
-				return checkStatusFail, fmt.Sprintf("CPA 服务不可达：%v", err), ""
-			}
-			return checkStatusWarn, fmt.Sprintf("CPA 服务不可达：%v", err), ""
+			return checkStatusFail, fmt.Sprintf("CPA 服务不可达：%v", err), ""
 		}
 		return checkStatusPass, fmt.Sprintf("CPA 服务可达，HTTP %d", statusCode), ""
 	})
 
-	addCheck("accounts", "账号可用性", func() (string, string, string) {
-		accountsList, err := s.getStore().ListAccounts()
-		if err != nil {
-			return checkStatusFail, fmt.Sprintf("读取账号失败：%v", err), ""
+	addCheck("credential", "凭证服务", func() (string, string, string) {
+		if s.credService == nil {
+			return checkStatusWarn, "未配置母系统凭证回调（credential.endpoint_base）", "单租户/开发模式将回退到全局 [cpa] 配置"
 		}
-		allowDisabled := s.allowDisabledStudioImageAccounts()
-		available := 0
-		for _, account := range accountsList {
-			if isImageAccountUsable(account, allowDisabled) {
-				available++
-			}
-		}
-		if len(accountsList) == 0 {
-			return checkStatusFail, "当前账号池为空", "请先导入或创建账号"
-		}
-		if result.Mode == "studio" && available == 0 {
-			return checkStatusFail, fmt.Sprintf("账号总数 %d，可用账号 0", len(accountsList)), "请刷新账号状态或修复代理后重试"
-		}
-		if available == 0 {
-			return checkStatusWarn, fmt.Sprintf("账号总数 %d，可用账号 0", len(accountsList)), ""
-		}
-		return checkStatusPass, fmt.Sprintf("账号总数 %d，可用账号 %d", len(accountsList), available), ""
+		return checkStatusPass, "已配置母系统凭证回调", ""
 	})
 
 	for _, item := range result.Checks {
@@ -320,29 +254,6 @@ func probeEndpoint(parent context.Context, targetURL, proxyURL string, timeout t
 	return resp.StatusCode, nil
 }
 
-func resolveProxyDialTarget(raw string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return "", err
-	}
-	host := parsed.Hostname()
-	if strings.TrimSpace(host) == "" {
-		return "", fmt.Errorf("proxy host is empty")
-	}
-	port := parsed.Port()
-	if port == "" {
-		switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
-		case "socks5", "socks5h":
-			port = "1080"
-		case "https":
-			port = "443"
-		default:
-			port = "80"
-		}
-	}
-	return net.JoinHostPort(host, port), nil
-}
-
 func normalizeProbeURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -358,13 +269,6 @@ func (s *Server) maskSensitiveConfig(payload configPayload) configPayload {
 	payload.App.APIKey = maskSecret(payload.App.APIKey)
 	payload.App.AuthKey = maskSecret(payload.App.AuthKey)
 	payload.CPA.APIKey = maskSecret(payload.CPA.APIKey)
-	payload.Sync.ManagementKey = maskSecret(payload.Sync.ManagementKey)
-	payload.Proxy.URL = maskURLAuth(payload.Proxy.URL)
-	payload.NewAPI.Password = maskSecret(payload.NewAPI.Password)
-	payload.NewAPI.AccessToken = maskSecret(payload.NewAPI.AccessToken)
-	payload.NewAPI.SessionCookie = maskSecret(payload.NewAPI.SessionCookie)
-	payload.Sub2API.Password = maskSecret(payload.Sub2API.Password)
-	payload.Sub2API.APIKey = maskSecret(payload.Sub2API.APIKey)
 	return payload
 }
 

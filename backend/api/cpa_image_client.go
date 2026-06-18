@@ -19,27 +19,67 @@ import (
 type cpaImageClient struct {
 	baseURL       string
 	apiKey        string
+	imageModel    string // upstream image model; falls back to cpaFixedImageModel when empty
 	httpClient    *http.Client
 	routeStrategy string
 	lastRoute     string
 	lastModel     string
 	lastToolModel string
+	// lastAssistantText holds the model's textual reply from the most recent
+	// /v1/responses turn. On the Responses route the model may answer with text
+	// instead of (or alongside) an image — e.g. a content refusal with an
+	// alternative suggestion. It is set by parseResponsesSSE and read once via
+	// LastAssistantText(); the images_api route leaves it empty.
+	lastAssistantText string
 }
 
 const maxCPAResponsesSSELineBytes = 128 << 20
 
 func newCPAImageClient(baseURL, apiKey string, timeout time.Duration, routeStrategy string) *cpaImageClient {
+	return newCPAImageClientWithModel(baseURL, apiKey, "", timeout, routeStrategy)
+}
+
+// newCPAImageClientWithModel builds a client whose upstream image model is
+// driven by the per-user credential (mother system's returned model). An empty
+// model falls back to cpaFixedImageModel for backward compatibility.
+func newCPAImageClientWithModel(baseURL, apiKey, imageModel string, timeout time.Duration, routeStrategy string) *cpaImageClient {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	return &cpaImageClient{
-		baseURL:       strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		baseURL:       normalizeCPAImageBaseURL(baseURL),
 		apiKey:        strings.TrimSpace(apiKey),
+		imageModel:    strings.TrimSpace(imageModel),
 		routeStrategy: normalizeCPAImageClientRouteStrategy(routeStrategy),
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
 	}
+}
+
+// normalizeCPAImageBaseURL trims a base URL down to the bare gateway origin this
+// client expects. Every request path is built with an explicit /v1 prefix
+// (/v1/images/generations, /v1/images/edits, /v1/responses), so the base must
+// NOT already carry /v1. The mother system's /internal/cred returns base_url
+// WITH the OpenAI-compatible /v1 suffix (docs §C.3, e.g. http://host:8080/v1);
+// left as-is that would double to /v1/v1/... and the gateway answers "404 page
+// not found". Strip a single trailing /v1 segment so both the mother's
+// /v1-suffixed base and a bare host work.
+func normalizeCPAImageBaseURL(raw string) string {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed := strings.TrimSuffix(base, "/v1"); trimmed != base {
+		base = strings.TrimRight(trimmed, "/")
+	}
+	return base
+}
+
+// imgModel returns the upstream image model: the per-user configured value when
+// set, otherwise the baked-in default.
+func (c *cpaImageClient) imgModel() string {
+	if model := strings.TrimSpace(c.imageModel); model != "" {
+		return model
+	}
+	return cpaFixedImageModel
 }
 
 func (c *cpaImageClient) LastRoute() string {
@@ -61,6 +101,18 @@ func (c *cpaImageClient) ImageToolModel() string {
 		return ""
 	}
 	return strings.TrimSpace(c.lastToolModel)
+}
+
+// LastAssistantText returns the model's textual reply captured from the most
+// recent /v1/responses turn (empty for the images_api route or when the model
+// returned no text). On the Responses route an image generation may legitimately
+// produce text only — e.g. the model refuses and proposes an alternative — and
+// that text is surfaced to the user instead of being dropped as a failure.
+func (c *cpaImageClient) LastAssistantText() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.lastAssistantText)
 }
 
 func (c *cpaImageClient) DownloadBytes(url string) ([]byte, error) {
@@ -247,12 +299,13 @@ func (c *cpaImageClient) executeJSONRequest(ctx context.Context, path string, bo
 
 func (c *cpaImageClient) setLastRoute(route string) {
 	c.lastRoute = strings.TrimSpace(route)
-	c.lastToolModel = cpaFixedImageModel
+	imageModel := c.imgModel()
+	c.lastToolModel = imageModel
 	if c.lastRoute == "codex_responses" {
-		c.lastModel = cpaResponsesMainModel + " (tool: " + cpaFixedImageModel + ")"
+		c.lastModel = cpaResponsesMainModel + " (tool: " + imageModel + ")"
 		return
 	}
-	c.lastModel = cpaFixedImageModel
+	c.lastModel = imageModel
 }
 
 func (c *cpaImageClient) parseImageAPIResponse(resp *http.Response) ([]handler.ImageResult, error) {
@@ -403,16 +456,73 @@ func (c *cpaImageClient) shouldFallbackToResponses(err error) bool {
 }
 
 func (c *cpaImageClient) generateViaResponses(ctx context.Context, prompt, size, quality, background string) ([]handler.ImageResult, error) {
-	payload := c.buildResponsesRequest(prompt, nil, nil, size, quality, background)
+	payload := c.buildResponsesRequest(ctx, prompt, nil, nil, size, quality, background)
 	return c.executeResponsesRequest(ctx, payload)
 }
 
 func (c *cpaImageClient) editViaResponses(ctx context.Context, prompt string, images [][]byte, mask []byte, size, quality string) ([]handler.ImageResult, error) {
-	payload := c.buildResponsesRequest(prompt, images, mask, size, quality, "")
+	payload := c.buildResponsesRequest(ctx, prompt, images, mask, size, quality, "")
 	return c.executeResponsesRequest(ctx, payload)
 }
 
-func (c *cpaImageClient) buildResponsesRequest(prompt string, images [][]byte, mask []byte, size, quality, background string) map[string]any {
+// priorTurnInputMessages turns replayed conversation context into Responses
+// input messages, oldest first, so the upstream model sees the chronological
+// textual + visual history before the current turn's message.
+func priorTurnInputMessages(ctx context.Context) []map[string]any {
+	turns := responsesContextFromContext(ctx)
+	if len(turns) == 0 {
+		return nil
+	}
+	messages := make([]map[string]any, 0, len(turns))
+	for _, turn := range turns {
+		content := make([]map[string]any, 0, 1+len(turn.Images))
+		if text := strings.TrimSpace(turn.Prompt); text != "" {
+			content = append(content, map[string]any{
+				"type": "input_text",
+				"text": text,
+			})
+		}
+		for _, image := range turn.Images {
+			if len(image) == 0 {
+				continue
+			}
+			content = append(content, map[string]any{
+				"type":      "input_image",
+				"image_url": encodeCPAImageDataURL(image, detectCPAImageMIME(image)),
+			})
+		}
+		// For an earlier image-bearing turn whose bytes were intentionally not
+		// inlined, add a text placeholder so the model knows an image existed at
+		// this point in the conversation without paying to re-send it. Only the
+		// latest image turn carries real bytes.
+		if turn.OmittedImageCount > 0 && len(turn.Images) == 0 {
+			content = append(content, map[string]any{
+				"type": "input_text",
+				"text": responsesOmittedImagePlaceholder(turn.OmittedImageCount),
+			})
+		}
+		if len(content) == 0 {
+			continue
+		}
+		messages = append(messages, map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": content,
+		})
+	}
+	return messages
+}
+
+// responsesOmittedImagePlaceholder is the text stand-in for an earlier turn's
+// images that were not re-inlined (only the latest image turn sends real bytes).
+func responsesOmittedImagePlaceholder(count int) string {
+	if count == 1 {
+		return "[此前本轮生成了 1 张图片，为节省篇幅未重复附上]"
+	}
+	return fmt.Sprintf("[此前本轮生成了 %d 张图片，为节省篇幅未重复附上]", count)
+}
+
+func (c *cpaImageClient) buildResponsesRequest(ctx context.Context, prompt string, images [][]byte, mask []byte, size, quality, background string) map[string]any {
 	content := make([]map[string]any, 0, 1+len(images))
 	content = append(content, map[string]any{
 		"type": "input_text",
@@ -435,7 +545,7 @@ func (c *cpaImageClient) buildResponsesRequest(prompt string, images [][]byte, m
 	tool := map[string]any{
 		"type":          "image_generation",
 		"action":        action,
-		"model":         cpaFixedImageModel,
+		"model":         c.imgModel(),
 		"output_format": "png",
 	}
 	if trimmedSize := strings.TrimSpace(size); trimmedSize != "" {
@@ -453,6 +563,15 @@ func (c *cpaImageClient) buildResponsesRequest(prompt string, images [][]byte, m
 		}
 	}
 
+	// Prepend prior-turn context (oldest first) so the current turn's message is
+	// last in the input array, preserving chronological order.
+	input := priorTurnInputMessages(ctx)
+	input = append(input, map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": content,
+	})
+
 	return map[string]any{
 		"instructions":        "",
 		"stream":              true,
@@ -462,14 +581,8 @@ func (c *cpaImageClient) buildResponsesRequest(prompt string, images [][]byte, m
 		"model":               cpaResponsesMainModel,
 		"store":               false,
 		"tool_choice":         map[string]any{"type": "image_generation"},
-		"input": []map[string]any{
-			{
-				"type":    "message",
-				"role":    "user",
-				"content": content,
-			},
-		},
-		"tools": []any{tool},
+		"input":               input,
+		"tools":               []any{tool},
 	}
 }
 
@@ -503,9 +616,55 @@ func (c *cpaImageClient) executeResponsesRequest(ctx context.Context, body map[s
 	return c.parseResponsesSSE(resp.Body)
 }
 
+// parseResponsesSSE consumes the native Responses SSE stream and extracts both
+// images and the model's textual reply. Unlike the images_api route, a Responses
+// turn does not guarantee an image: the model may answer with text only (e.g. a
+// content refusal that proposes an alternative). The real upstream stream (see
+// the mother system's codex passthrough) carries:
+//   - images in `response.output_item.done` items of type "image_generation_call"
+//     (field `result`, base64); a successful image has a non-empty result.
+//   - the assistant's text in `response.output_item.done` items of type "message"
+//     (content[].type == "output_text"); it is also streamed incrementally via
+//     `response.output_text.delta` events, which we accumulate as a fallback for
+//     when the terminal message item is absent.
+//
+// `response.completed.output` is empty in practice, so we collect from the
+// per-item done events and only fall back to the completed output if it happens
+// to carry results. The captured text is stored on the client (LastAssistantText)
+// so the caller can surface it even when zero images are returned — that case is
+// NOT an error.
 func (c *cpaImageClient) parseResponsesSSE(reader io.Reader) ([]handler.ImageResult, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 1024*1024), maxCPAResponsesSSELineBytes)
+
+	results := make([]handler.ImageResult, 0, 2)
+	var finalText strings.Builder // accumulated output_text.delta (fallback)
+	var messageText string        // text from a completed message item (preferred)
+
+	appendImage := func(item cpaResponsesOutputItem) {
+		result := strings.TrimSpace(item.Result)
+		if result == "" {
+			return
+		}
+		imageURL := result
+		if !strings.HasPrefix(strings.ToLower(imageURL), "data:image/") {
+			imageURL = encodeCPAImageDataURLFromBase64(result, mimeTypeFromOutputFormat(item.OutputFormat))
+		}
+		results = append(results, handler.ImageResult{
+			URL:           imageURL,
+			RevisedPrompt: strings.TrimSpace(item.RevisedPrompt),
+		})
+	}
+
+	messageItemText := func(item cpaResponsesOutputItem) string {
+		var b strings.Builder
+		for _, part := range item.Content {
+			if part.Type == "output_text" || part.Type == "text" || part.Type == "" {
+				b.WriteString(part.Text)
+			}
+		}
+		return b.String()
+	}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -517,54 +676,81 @@ func (c *cpaImageClient) parseResponsesSSE(reader io.Reader) ([]handler.ImageRes
 			continue
 		}
 
-		var event cpaResponsesCompletedEvent
+		var event cpaResponsesStreamEvent
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			continue
 		}
-		if event.Type != "response.completed" {
-			continue
-		}
 
-		results := make([]handler.ImageResult, 0, len(event.Response.Output))
-		for _, item := range event.Response.Output {
-			if item.Type != "image_generation_call" {
-				continue
+		switch event.Type {
+		case "response.output_text.delta":
+			finalText.WriteString(event.Delta)
+		case "response.output_item.done":
+			switch event.Item.Type {
+			case "image_generation_call":
+				appendImage(event.Item)
+			case "message":
+				if text := strings.TrimSpace(messageItemText(event.Item)); text != "" {
+					messageText = text
+				}
 			}
-			result := strings.TrimSpace(item.Result)
-			if result == "" {
-				continue
+		case "response.completed":
+			// Fallback only: the real stream leaves output empty, but honor it if
+			// a future upstream populates it.
+			for _, item := range event.Response.Output {
+				switch item.Type {
+				case "image_generation_call":
+					appendImage(item)
+				case "message":
+					if text := strings.TrimSpace(messageItemText(item)); text != "" && messageText == "" {
+						messageText = text
+					}
+				}
 			}
-
-			imageURL := result
-			if !strings.HasPrefix(strings.ToLower(imageURL), "data:image/") {
-				imageURL = encodeCPAImageDataURLFromBase64(result, mimeTypeFromOutputFormat(item.OutputFormat))
-			}
-			results = append(results, handler.ImageResult{
-				URL:           imageURL,
-				RevisedPrompt: strings.TrimSpace(item.RevisedPrompt),
-			})
 		}
-		if len(results) == 0 {
-			return nil, fmt.Errorf("cpa did not return image output")
-		}
-		return results, nil
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read CPA responses stream: %w", err)
 	}
-	return nil, fmt.Errorf("cpa did not return image output")
+
+	text := strings.TrimSpace(messageText)
+	if text == "" {
+		text = strings.TrimSpace(finalText.String())
+	}
+	c.lastAssistantText = text
+
+	// Text-only replies (e.g. a content refusal) are a valid outcome: return no
+	// images and no error, letting the caller surface LastAssistantText. Only a
+	// truly empty stream (no image AND no text) is an error.
+	if len(results) == 0 && text == "" {
+		return nil, fmt.Errorf("cpa did not return image output")
+	}
+	return results, nil
 }
 
-type cpaResponsesCompletedEvent struct {
-	Type     string `json:"type"`
+// cpaResponsesOutputItem is a single item inside a Responses output array, used
+// both for the per-item `response.output_item.done` events and the (usually
+// empty) `response.completed.output` array.
+type cpaResponsesOutputItem struct {
+	Type          string `json:"type"`
+	Result        string `json:"result"`
+	RevisedPrompt string `json:"revised_prompt"`
+	OutputFormat  string `json:"output_format"`
+	Role          string `json:"role"`
+	Content       []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+// cpaResponsesStreamEvent covers the SSE event shapes we consume: incremental
+// text deltas, per-item completions, and the terminal completed event.
+type cpaResponsesStreamEvent struct {
+	Type     string                 `json:"type"`
+	Delta    string                 `json:"delta"`
+	Item     cpaResponsesOutputItem `json:"item"`
 	Response struct {
-		Output []struct {
-			Type          string `json:"type"`
-			Result        string `json:"result"`
-			RevisedPrompt string `json:"revised_prompt"`
-			OutputFormat  string `json:"output_format"`
-		} `json:"output"`
+		Output []cpaResponsesOutputItem `json:"output"`
 	} `json:"response"`
 }
 

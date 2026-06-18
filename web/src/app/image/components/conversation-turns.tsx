@@ -320,141 +320,167 @@ export const ConversationTurns = memo(function ConversationTurns({
                 </span>
               </div>
 
-              {turn.images.length > 0 ? (
-                <div
-                  className={cn(
-                    "grid gap-4",
-                    turn.images.length === 1
-                      ? "grid-cols-1"
-                      : "grid-cols-1 lg:grid-cols-2",
-                  )}
-                >
-                  {turn.images.map((image, index) => {
-                    const imageDataUrl = buildImageDataUrl(image);
-                    const downloadName = buildDownloadName(
-                      turn.createdAt,
-                      turn.id,
-                      index,
-                    );
+              {(() => {
+                // Text-only results (model replied with text, no image — e.g. a
+                // content refusal proposing an alternative) carry status "text".
+                // They are rendered as an assistant text bubble below, not in the
+                // image grid, so the grid shows only real image cells.
+                const imageItems = turn.images.filter(
+                  (image) => image.status !== "text",
+                );
+                const assistantText = turn.images
+                  .map((image) => (image.assistant_text || "").trim())
+                  .find((text) => text.length > 0);
 
-                    return (
+                return (
+                  <>
+                    {imageItems.length > 0 ? (
                       <div
-                        key={image.id}
                         className={cn(
-                          "overflow-hidden rounded-[22px] border border-stone-200 bg-white shadow-sm",
-                          image.status === "success" &&
-                            "w-fit max-w-[75%] justify-self-start",
-                          image.status !== "success" &&
-                            "w-full max-w-[270px] justify-self-start",
+                          "grid gap-4",
+                          imageItems.length === 1
+                            ? "grid-cols-1"
+                            : "grid-cols-1 lg:grid-cols-2",
                         )}
                       >
-                        {image.status === "success" && imageDataUrl ? (
-                          <div>
-                            <Zoom>
-                              <Image
-                                src={imageDataUrl}
-                                alt={`Generated result ${index + 1}`}
-                                width={1024}
-                                height={1024}
-                                unoptimized
-                                className="block h-auto max-h-[270px] w-auto max-w-full cursor-zoom-in"
-                              />
-                            </Zoom>
-                            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                onClick={() =>
-                                  onOpenSelectionEditor(
-                                    conversationId,
-                                    turn.id,
-                                    image,
-                                    downloadName,
-                                  )
-                                }
-                                title="选区"
-                                aria-label="选区"
-                              >
-                                <Brush className="size-4" />
-                              </button>
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                onClick={() =>
-                                  onSeedFromResult(
-                                    conversationId,
-                                    image,
-                                    "edit",
-                                  )
-                                }
-                                title="引用"
-                                aria-label="引用"
-                              >
-                                <Copy className="size-4" />
-                              </button>
-                              <a
-                                href={imageDataUrl}
-                                download={downloadName}
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
-                                title="下载"
-                                aria-label="下载"
-                              >
-                                <Download className="size-4" />
-                              </a>
-                            </div>
-                          </div>
-                        ) : image.status === "error" ? (
-                          <div className="flex min-h-[320px] flex-col">
-                            <div className="flex flex-1 items-center justify-center whitespace-pre-line bg-rose-50 px-6 py-8 text-center text-sm leading-7 text-rose-600">
-                              {formatImageErrorMessage(
-                                image.error || "处理失败",
+                        {imageItems.map((image, index) => {
+                          const imageDataUrl = buildImageDataUrl(image);
+                          const downloadName = buildDownloadName(
+                            turn.createdAt,
+                            turn.id,
+                            index,
+                          );
+
+                          return (
+                            <div
+                              key={image.id}
+                              className={cn(
+                                "overflow-hidden rounded-[22px] border border-stone-200 bg-white shadow-sm",
+                                image.status === "success" &&
+                                  "w-fit max-w-[75%] justify-self-start",
+                                image.status !== "success" &&
+                                  "w-full max-w-[270px] justify-self-start",
+                              )}
+                            >
+                              {image.status === "success" && imageDataUrl ? (
+                                <div>
+                                  <Zoom>
+                                    <Image
+                                      src={imageDataUrl}
+                                      alt={`Generated result ${index + 1}`}
+                                      width={1024}
+                                      height={1024}
+                                      unoptimized
+                                      className="block h-auto max-h-[270px] w-auto max-w-full cursor-zoom-in"
+                                    />
+                                  </Zoom>
+                                  <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
+                                    <button
+                                      type="button"
+                                      className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
+                                      onClick={() =>
+                                        onOpenSelectionEditor(
+                                          conversationId,
+                                          turn.id,
+                                          image,
+                                          downloadName,
+                                        )
+                                      }
+                                      title="选区"
+                                      aria-label="选区"
+                                    >
+                                      <Brush className="size-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
+                                      onClick={() =>
+                                        onSeedFromResult(
+                                          conversationId,
+                                          image,
+                                          "edit",
+                                        )
+                                      }
+                                      title="引用"
+                                      aria-label="引用"
+                                    >
+                                      <Copy className="size-4" />
+                                    </button>
+                                    <a
+                                      href={imageDataUrl}
+                                      download={downloadName}
+                                      className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-600 transition hover:bg-stone-100 hover:text-stone-900"
+                                      title="下载"
+                                      aria-label="下载"
+                                    >
+                                      <Download className="size-4" />
+                                    </a>
+                                  </div>
+                                </div>
+                              ) : image.status === "error" ? (
+                                <div className="flex min-h-[320px] flex-col">
+                                  <div className="flex flex-1 items-center justify-center whitespace-pre-line bg-rose-50 px-6 py-8 text-center text-sm leading-7 text-rose-600">
+                                    {formatImageErrorMessage(
+                                      image.error || "处理失败",
+                                    )}
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
+                                    <button
+                                      type="button"
+                                      className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-rose-600 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                      onClick={() =>
+                                        void onRetryTurn(
+                                          conversationId,
+                                          turn,
+                                          index,
+                                        )
+                                      }
+                                      disabled={turnProcessing}
+                                      title={turnProcessing ? "处理中" : "重试"}
+                                      aria-label="重试"
+                                    >
+                                      <RotateCcw className="size-4" />
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 bg-stone-50 px-6 py-8 text-center text-stone-500">
+                                  <div className="rounded-full bg-white p-3 shadow-sm">
+                                    <LoaderCircle className="size-5 animate-spin" />
+                                  </div>
+                                  <p className="text-sm font-medium text-stone-700">
+                                    {cancelRequested
+                                      ? "正在取消任务"
+                                      : showQueuedState
+                                      ? "已加入等候队列"
+                                      : turnProcessing && processingStatus
+                                      ? `${processingStatus.title}${waitingDots}`
+                                      : "正在处理图片..."}
+                                  </p>
+                                  <p className="text-xs leading-6 text-stone-400">
+                                    {cancelRequested
+                                      ? "正在等待当前请求结束，取消后将丢弃本次结果"
+                                      : showQueuedState
+                                      ? `${turn.waitingDetail || formatWaitingReason(turn.waitingReason)}${(turn.queuePosition ?? 0) > 1 ? ` · 前面还有 ${turn.queuePosition! - 1} 个` : ""}`
+                                      : turnProcessing && processingStatus
+                                      ? `${processingStatus.detail} · 已等待 ${formatProcessingDuration(submitElapsedSeconds)}`
+                                      : "图片处理通常需要几分钟，请稍候"}
+                                  </p>
+                                </div>
                               )}
                             </div>
-                            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-4 py-3">
-                              <button
-                                type="button"
-                                className="inline-flex size-9 items-center justify-center rounded-full border border-stone-200 bg-white text-rose-600 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                onClick={() =>
-                                  void onRetryTurn(conversationId, turn, index)
-                                }
-                                disabled={turnProcessing}
-                                title={turnProcessing ? "处理中" : "重试"}
-                                aria-label="重试"
-                              >
-                                <RotateCcw className="size-4" />
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 bg-stone-50 px-6 py-8 text-center text-stone-500">
-                            <div className="rounded-full bg-white p-3 shadow-sm">
-                              <LoaderCircle className="size-5 animate-spin" />
-                            </div>
-                            <p className="text-sm font-medium text-stone-700">
-                              {cancelRequested
-                                ? "正在取消任务"
-                                : showQueuedState
-                                ? "已加入等候队列"
-                                : turnProcessing && processingStatus
-                                ? `${processingStatus.title}${waitingDots}`
-                                : "正在处理图片..."}
-                            </p>
-                            <p className="text-xs leading-6 text-stone-400">
-                              {cancelRequested
-                                ? "正在等待当前请求结束，取消后将丢弃本次结果"
-                                : showQueuedState
-                                ? `${turn.waitingDetail || formatWaitingReason(turn.waitingReason)}${(turn.queuePosition ?? 0) > 1 ? ` · 前面还有 ${turn.queuePosition! - 1} 个` : ""}`
-                                : turnProcessing && processingStatus
-                                ? `${processingStatus.detail} · 已等待 ${formatProcessingDuration(submitElapsedSeconds)}`
-                                : "图片处理通常需要几分钟，请稍候"}
-                            </p>
-                          </div>
-                        )}
+                          );
+                        })}
                       </div>
-                    );
-                  })}
-                </div>
-              ) : null}
+                    ) : null}
+                    {assistantText ? (
+                      <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-[22px] border border-stone-200 bg-white px-5 py-4 text-[15px] leading-7 text-stone-800 shadow-sm">
+                        {assistantText}
+                      </div>
+                    ) : null}
+                  </>
+                );
+              })()}
               {isCancelableTask ? (
                 <div className="flex px-1">
                   <button

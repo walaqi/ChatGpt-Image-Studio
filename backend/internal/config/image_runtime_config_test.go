@@ -24,9 +24,6 @@ func TestImageQueueAndQuotaRefreshDefaults(t *testing.T) {
 	if got := cfg.ImageTaskQueueTTL(); got != 600*time.Second {
 		t.Fatalf("ImageTaskQueueTTL() = %s, want 600s", got)
 	}
-	if got := cfg.ImageQuotaRefreshTTL(); got != 120*time.Second {
-		t.Fatalf("ImageQuotaRefreshTTL() = %s, want 120s", got)
-	}
 }
 
 func TestImageQueueAndQuotaRefreshCustomValues(t *testing.T) {
@@ -36,9 +33,6 @@ func TestImageQueueAndQuotaRefreshCustomValues(t *testing.T) {
 			ImageQueueLimit:          48,
 			ImageQueueTimeoutSeconds: 35,
 			ImageTaskQueueTTLSeconds: 480,
-		},
-		Accounts: AccountsConfig{
-			ImageQuotaRefreshTTLSeconds: 180,
 		},
 	}
 
@@ -54,8 +48,5 @@ func TestImageQueueAndQuotaRefreshCustomValues(t *testing.T) {
 	}
 	if got := cfg.ImageTaskQueueTTL(); got != 480*time.Second {
 		t.Fatalf("ImageTaskQueueTTL() = %s, want 480s", got)
-	}
-	if got := cfg.ImageQuotaRefreshTTL(); got != 180*time.Second {
-		t.Fatalf("ImageQuotaRefreshTTL() = %s, want 180s", got)
 	}
 }

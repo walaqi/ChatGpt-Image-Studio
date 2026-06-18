@@ -1,7 +1,7 @@
 import axios, { AxiosError, type AxiosRequestConfig } from "axios";
 
 import webConfig from "@/constants/common-env";
-import { clearStoredAuthKey, getStoredAuthKey } from "@/store/auth";
+import { requestReauth } from "@/store/auth";
 
 type RequestConfig = AxiosRequestConfig & {
   redirectOnUnauthorized?: boolean;
@@ -26,32 +26,23 @@ export class ApiError extends Error {
   }
 }
 
+// Multi-tenant auth model (docs/multi-tenant-redesign.md §4.6): the session
+// lives in an HttpOnly cookie, so every request must send credentials and we
+// never attach a bearer token. A 401 means the session expired/was never
+// established; ask the mother system to re-issue an entry ticket.
 const request = axios.create({
   baseURL: webConfig.apiUrl.replace(/\/$/, ""),
-});
-
-request.interceptors.request.use(async (config) => {
-  const nextConfig = { ...config };
-  const authKey = await getStoredAuthKey();
-  const headers = { ...(nextConfig.headers || {}) } as Record<string, string>;
-  if (authKey && !headers.Authorization) {
-    headers.Authorization = `Bearer ${authKey}`;
-  }
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-expect-error
-  nextConfig.headers = headers;
-  return nextConfig;
+  withCredentials: true,
 });
 
 request.interceptors.response.use(
   (response) => response,
   async (error: AxiosError<ErrorPayload>) => {
     const status = error.response?.status;
-    const shouldRedirect =
+    const shouldReauth =
       (error.config as RequestConfig | undefined)?.redirectOnUnauthorized !== false;
-    if (status === 401 && shouldRedirect && typeof window !== "undefined") {
-      await clearStoredAuthKey();
-      window.location.href = "/login";
+    if (status === 401 && shouldReauth && typeof window !== "undefined") {
+      requestReauth();
     }
 
     const payload = error.response?.data;
@@ -59,10 +50,7 @@ request.interceptors.response.use(
       payload && typeof payload.error === "object" && payload.error
         ? (payload.error as { message?: string; code?: string })
         : null;
-    const code =
-      payload?.detail?.code ||
-      nestedError?.code ||
-      payload?.code;
+    const code = payload?.detail?.code || nestedError?.code || payload?.code;
     const message =
       payload?.detail?.error ||
       payload?.detail?.message ||
