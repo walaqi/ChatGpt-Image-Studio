@@ -204,3 +204,35 @@ func TestValidateCoercesMismatchedImageStorageModes(t *testing.T) {
 		t.Fatalf("expected mismatched storage modes to coerce to server/server, got %q/%q", cfg.Storage.ImageConversationStorage, cfg.Storage.ImageDataStorage)
 	}
 }
+
+func TestOverrideAllowedOriginsSlice(t *testing.T) {
+	rootDir := t.TempDir()
+	dataDir := filepath.Join(rootDir, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+
+	overridePath := filepath.Join(dataDir, userConfigFile)
+	override := strings.Join([]string{
+		"[server]",
+		`allowed_origins = ["https://example.com", "https://other.com"]`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(overridePath, []byte(override), 0o644); err != nil {
+		t.Fatalf("write override: %v", err)
+	}
+
+	cfg := New(rootDir)
+	if err := cfg.Load(); err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if len(cfg.Server.AllowedOrigins) != 2 {
+		t.Fatalf("AllowedOrigins length = %d, want 2", len(cfg.Server.AllowedOrigins))
+	}
+	if cfg.Server.AllowedOrigins[0] != "https://example.com" {
+		t.Fatalf("AllowedOrigins[0] = %q, want https://example.com", cfg.Server.AllowedOrigins[0])
+	}
+	if cfg.Server.AllowedOrigins[1] != "https://other.com" {
+		t.Fatalf("AllowedOrigins[1] = %q, want https://other.com", cfg.Server.AllowedOrigins[1])
+	}
+}

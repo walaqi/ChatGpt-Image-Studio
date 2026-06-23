@@ -822,6 +822,34 @@ func setOverrideValue(dst reflect.Value, raw any) error {
 		default:
 			return fmt.Errorf("expected int, got %T", raw)
 		}
+	case reflect.Slice:
+		// Handle []string fields (e.g. allowed_origins). TOML decodes arrays
+		// as []interface{} so we must convert element-by-element.
+		if dst.Type().Elem().Kind() == reflect.String {
+			switch arr := raw.(type) {
+			case []interface{}:
+				slice := make([]string, 0, len(arr))
+				for _, elem := range arr {
+					s, ok := elem.(string)
+					if !ok {
+						return fmt.Errorf("expected []string element, got %T", elem)
+					}
+					slice = append(slice, s)
+				}
+				dst.Set(reflect.ValueOf(slice))
+			case []string:
+				dst.Set(reflect.ValueOf(arr))
+			default:
+				return fmt.Errorf("expected []string, got %T", raw)
+			}
+		} else {
+			value := reflect.ValueOf(raw)
+			if value.IsValid() && value.Type().AssignableTo(dst.Type()) {
+				dst.Set(value)
+				return nil
+			}
+			return fmt.Errorf("unsupported slice element type %s", dst.Type().Elem())
+		}
 	default:
 		value := reflect.ValueOf(raw)
 		if value.IsValid() && value.Type().AssignableTo(dst.Type()) {
